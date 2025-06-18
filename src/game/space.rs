@@ -4,6 +4,8 @@ use std::str::FromStr;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
+use crate::game::Status;
+
 pub const BOARD_LETTERS: &str = "ABCDEFGHIJK";
 
 /// The two sides of the game
@@ -21,6 +23,13 @@ impl Role {
         match self {
             Role::Attacker => Role::Defender,
             Role::Defender => Role::Attacker,
+        }
+    }
+
+    pub fn victory(&self) -> Status {
+        match self {
+            Role::Attacker => Status::AttackersWin,
+            Role::Defender => Status::DefendersWin,
         }
     }
 }
@@ -56,6 +65,8 @@ pub enum Space {
 }
 
 impl Space {
+    /// Check if the piece occupying this square is on the
+    /// same side as `role`.
     pub fn is_ally(&self, role: &Role) -> bool {
         match self {
             Space::Occupied(r) => r == role,
@@ -150,17 +161,9 @@ impl FromStr for Square {
 }
 
 impl Square {
-    #[must_use]
-    pub fn fmt_other(&self) -> String {
-        format!(
-            "{}{}",
-            BOARD_LETTERS.chars().collect::<Vec<_>>()[self.x],
-            11 - self.y
-        )
-    }
-
+    /// Checks if the square is one of the corners or the throne
     pub fn is_restricted(&self) -> bool {
-        RESTRICTED_SQUARES.contains(&self)
+        RESTRICTED_SQUARES.contains(self)
     }
 
     #[must_use]
@@ -211,29 +214,72 @@ impl Square {
         }
     }
 
-    #[must_use]
-    pub fn touches_wall(&self) -> bool {
-        self.x == 0 || self.x == 10 || self.y == 0 || self.y == 10
-    }
-
-    pub fn iter() -> Self {
-        Self { x: 0, y: 0 }
+    /// Get an iterator over all squares in the board
+    pub fn iter() -> SquareIter {
+        SquareIter::default()
     }
 }
 
-impl Iterator for Square {
-    type Item = Self;
+#[derive(Default)]
+pub struct SquareIter(Option<Square>);
+impl Iterator for SquareIter {
+    type Item = Square;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.y < 10 {
-            self.y += 1;
-            Some(*self)
-        } else if self.x == 10 {
-            None
-        } else {
-            self.y = 0;
-            self.x += 1;
-            Some(*self)
+        match self.0.as_mut() {
+            None => self.0 = Some(Square { x: 0, y: 0 }),
+            Some(sq) => {
+                if sq.y < 10 {
+                    sq.y += 1;
+                } else if sq.x == 10 {
+                    return None;
+                } else {
+                    sq.y = 0;
+                    sq.x += 1;
+                }
+            }
         }
+        self.0
+    }
+}
+
+#[cfg(test)]
+mod test_spaces {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// Test that the iteration over the squares visits
+    /// every square on the board exactly once.
+    #[test]
+    fn test_square_iter() {
+        let mut squares = HashSet::new();
+        for sq in Square::iter() {
+            assert!(squares.insert(sq));
+            assert!(sq.x < 11);
+            assert!(sq.y < 11);
+        }
+        assert_eq!(squares.len(), 11 * 11);
+    }
+
+    /// Check that we can correctly tell which side a piece is on
+    #[test]
+    fn test_is_ally() {
+        assert!(!Space::Empty.is_ally(&Role::Defender));
+        assert!(!Space::Empty.is_ally(&Role::Attacker));
+        assert!(Space::King.is_ally(&Role::Defender));
+        assert!(!Space::King.is_ally(&Role::Attacker));
+        assert!(Space::Occupied(Role::Defender).is_ally(&Role::Defender));
+        assert!(!Space::Occupied(Role::Defender).is_ally(&Role::Attacker));
+        assert!(Space::Occupied(Role::Attacker).is_ally(&Role::Attacker));
+        assert!(!Space::Occupied(Role::Attacker).is_ally(&Role::Defender));
+    }
+
+    /// Spot checks that we label squares correctly
+    #[test]
+    fn test_fmt() {
+        assert_eq!(Square { x: 0, y: 10 }.to_string(), "A1");
+        assert_eq!(Square { x: 0, y: 0 }.to_string(), "A11");
+        assert_eq!(Square { x: 4, y: 6 }.to_string(), "E5");
+        assert_eq!(Square { x: 5, y: 5 }.to_string(), "F6");
     }
 }
