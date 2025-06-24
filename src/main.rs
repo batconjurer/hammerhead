@@ -23,6 +23,11 @@ struct Args {
 enum Commands {
     #[command(about = "Make moves on a board in a non-game setting.")]
     Explore,
+    #[command(about = "Train an AI via self play.")]
+    Train {
+        #[arg(help = "The number of improved versions to create.")]
+        iterations: u64,
+    },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -57,19 +62,20 @@ fn main() {
     let cli = Args::parse();
     match cli.command {
         Commands::Explore => explore(),
+        Commands::Train { iterations } => mcts::train(iterations),
     }
 }
 
 fn user_input() -> GameCommand {
-    println!("");
+    println!();
     loop {
         print!("Input command: ");
         io::stdout().flush().unwrap();
         let mut buffer = String::new();
-        if !io::stdin().read_line(&mut buffer).is_ok() {
+        if io::stdin().read_line(&mut buffer).is_err() {
             continue;
         };
-        match GameCommand::from_str(&buffer.trim()) {
+        match GameCommand::from_str(buffer.trim()) {
             Ok(command) => return command,
             Err(e) => {
                 print!("\x1B[2A\x1B[J");

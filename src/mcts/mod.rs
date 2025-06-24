@@ -1,27 +1,26 @@
+mod backpropogation;
+mod selection;
+mod train;
+
+use std::path::Path;
 use std::sync::{Arc, Mutex};
+
+use arboriter_mcts::{Action, GameState, Player};
+use candle_core::{Device, Module, Tensor};
+pub use train::train;
+
 use crate::game::board::Board;
-use crate::game::space::{Role, Square};
+use crate::game::space::{EXIT_SQUARES, Role, Space, Square};
 use crate::game::{Play, PreviousBoards, Status};
-use arboriter_mcts::policy::StandardPolicy;
-use arboriter_mcts::policy::selection::{SelectionPolicy, UCB1Policy};
-use arboriter_mcts::{Action, BackpropagationPolicy, GameState, MCTSNode, Player};
 use crate::nn::TaflNNet;
 
-#[derive(Clone)]
-pub struct NNSelectionPolicy {
-    attacker_nn: Arc<Mutex<TaflNNet>>,
-    defender_nn: Arc<Mutex<TaflNNet>>,
-    fallback: UCB1Policy,
-}
-
-impl SelectionPolicy<Game> for NNSelectionPolicy {
-    fn select_child(&self, node: &MCTSNode<Game>) -> usize {
-        self.fallback.select_child(node)
-    }
-
-    fn clone_box(&self) -> Box<dyn SelectionPolicy<Game>> {
-        Box::new(self.clone())
-    }
+/// Determine if a position is "quiet" or not.
+/// Currently, we define threats as the ability
+/// for the king to escape on the current move.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Threats {
+    Quiet,
+    Plays(Vec<Play>),
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -30,6 +29,73 @@ pub struct Game {
     pub previous_boards: PreviousBoards,
     pub turn: Role,
     pub current_board: Board,
+}
+
+impl Game {
+    /// Return a list of threats. If there are none, label the position
+    /// quiet. This is subjective and will be used to tweak the performance
+    /// of the final AI in the endgame.
+    pub fn threats(&self) -> Threats {
+        if let Role::Defender = self.turn {
+            let Some(king) = self.current_board.find_the_king() else {
+                return Threats::Quiet;
+            };
+            let mut threats = Vec::with_capacity(4);
+            for corner in EXIT_SQUARES {
+                let play = Play {
+                    role: Role::Defender,
+                    from: king,
+                    to: corner,
+                };
+                if self
+                    .current_board
+                    .play_internal(&play, &Status::Ongoing, &self.previous_boards)
+                    .is_ok()
+                {
+                    threats.push(play);
+                }
+            }
+            if threats.is_empty() {
+                Threats::Quiet
+            } else {
+                Threats::Plays(threats)
+            }
+        } else {
+            Threats::Quiet
+        }
+    }
+}
+
+impl TryFrom<&Game> for Tensor {
+    type Error = candle_core::Error;
+
+    fn try_from(game: &Game) -> Result<Self, Self::Error> {
+        let (attackers, defenders) = Square::iter()
+            .map(|sq| match game.current_board.get(&sq) {
+                Space::Occupied(Role::Attacker) => (1u8, 0u8),
+                Space::Occupied(Role::Defender) => (0, 1),
+                Space::King => (0, 2),
+                Space::Empty => (0, 0),
+            })
+            .unzip::<_, _, Vec<_>, Vec<_>>();
+
+        Tensor::from_vec(
+            attackers
+                .into_iter()
+                .chain(defenders)
+                .chain(
+                    [if game.turn == Role::Attacker {
+                        1u8
+                    } else {
+                        0u8
+                    }; 11 * 11],
+                )
+                .chain([game.previous_boards.0.len() as u8; 11 * 11])
+                .collect(),
+            (4, 11, 11),
+            &Device::Cpu,
+        )
+    }
 }
 
 impl Action for Play {
@@ -86,10 +152,7 @@ impl GameState for Game {
     }
 
     fn is_terminal(&self) -> bool {
-        match self.status {
-            Status::Ongoing => false,
-            _ => true,
-        }
+        !matches!(self.status, Status::Ongoing)
     }
 
     fn get_result(&self, for_player: &Self::Player) -> f64 {
@@ -98,11 +161,13 @@ impl GameState for Game {
                 Status::AttackersWin => 1.0,
                 Status::DefendersWin => 0.0,
                 Status::Ongoing => unreachable!(),
+                Status::Draw => 0.5,
             },
             Role::Defender => match self.status {
                 Status::AttackersWin => 0.0,
                 Status::DefendersWin => 1.0,
                 Status::Ongoing => unreachable!(),
+                Status::Draw => 0.5,
             },
         }
     }
@@ -112,19 +177,171 @@ impl GameState for Game {
     }
 }
 
+/// An enum indicating whether a [`TaflNNet`] is being
+/// trained or simply being used to play.
 #[derive(Clone)]
-pub struct NNBackpropogation {
-    attacker_nn: (),
-    defender_nn: (),
-    fallback: StandardPolicy,
+pub enum NNetRole {
+    Training(Arc<Mutex<TaflNNet>>),
+    Playing(Arc<Mutex<TaflNNet>>),
 }
 
-impl BackpropagationPolicy<Game> for NNBackpropogation {
-    fn update_stats(&self, node: &mut MCTSNode<Game>, result: f64) {
-        self.fallback.update_stats(node, result);
+impl NNetRole {
+    /// Open training neural network
+    pub fn training(p: impl AsRef<Path>) -> Self {
+        NNetRole::Training(Arc::new(Mutex::new(TaflNNet::new(p))))
     }
 
-    fn clone_box(&self) -> Box<dyn BackpropagationPolicy<Game>> {
-        Box::new(self.clone())
+    /// Open playing neural network
+    pub fn playing(p: impl AsRef<Path>) -> Self {
+        NNetRole::Playing(Arc::new(Mutex::new(TaflNNet::new(p))))
+    }
+
+    /// Get the inner pointer
+    fn inner(&self) -> &Arc<Mutex<TaflNNet>> {
+        match self {
+            NNetRole::Training(nn) => nn,
+            NNetRole::Playing(nn) => nn,
+        }
+    }
+
+    /// Evaluate the inner [`TaflNNet`] on the given tensor and
+    /// cast it to a float
+    fn eval(&self, tensor: &Tensor) -> f64 {
+        self.inner()
+            .lock()
+            .unwrap()
+            .forward(tensor)
+            .unwrap()
+            .to_scalar::<f64>()
+            .unwrap()
+    }
+
+    /// A helper function to help policies determine if a
+    /// given neural network is currently being trained
+    fn is_training(nn: Option<&Self>) -> bool {
+        matches!(nn, Some(NNetRole::Training(_)))
+    }
+
+    /// Train the neural network to learn the evaluation of the given
+    /// board position
+    fn train(&self, game: &Game, result: f64) {
+        let tensor = Tensor::try_from(game).unwrap();
+        let result = Tensor::new(&[result], &Device::Cpu).unwrap();
+        let Self::Training(nn) = self else { return };
+        let mut guard = nn.lock().unwrap();
+        // TODO! Should we train on board symmetries here as well?
+        guard.train(&tensor, &result, 500).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Game, Threats};
+    use crate::game::Play;
+    use crate::game::board::Board;
+    use crate::game::space::{Role, Square};
+
+    #[test]
+    fn test_threats() {
+        let board = [
+            "...........",
+            "...........",
+            ".X.........",
+            ".X.........",
+            ".X.........",
+            ".X.........",
+            "...........",
+            ".X.........",
+            "KX.........",
+            ".X.........",
+            "...........",
+        ];
+        let mut game = Game {
+            status: Default::default(),
+            previous_boards: Default::default(),
+            turn: Role::Attacker,
+            current_board: Board::try_from(board).expect("Test failed"),
+        };
+
+        assert_eq!(Threats::Quiet, game.threats());
+        game.turn = Role::Defender;
+        let expected = vec![
+            Play {
+                role: Role::Defender,
+                from: Square { x: 0, y: 8 },
+                to: Square { x: 0, y: 0 },
+            },
+            Play {
+                role: Role::Defender,
+                from: Square { x: 0, y: 8 },
+                to: Square { x: 0, y: 10 },
+            },
+        ];
+        assert_eq!(Threats::Plays(expected), game.threats());
+        let board = [
+            "...........",
+            "...........",
+            ".X.........",
+            ".X.........",
+            ".X.........",
+            ".X.........",
+            "...........",
+            "OX.........",
+            "KX.........",
+            ".X.........",
+            "...........",
+        ];
+        let game = Game {
+            status: Default::default(),
+            previous_boards: Default::default(),
+            turn: Role::Defender,
+            current_board: Board::try_from(board).expect("Test failed"),
+        };
+        let expected = vec![Play {
+            role: Role::Defender,
+            from: Square { x: 0, y: 8 },
+            to: Square { x: 0, y: 10 },
+        }];
+        assert_eq!(Threats::Plays(expected), game.threats());
+        let board = [
+            "...........",
+            "...........",
+            ".X.........",
+            ".X.........",
+            ".X.........",
+            ".X.........",
+            "...........",
+            "OX.........",
+            "KX.........",
+            "OX.........",
+            "...........",
+        ];
+        let game = Game {
+            status: Default::default(),
+            previous_boards: Default::default(),
+            turn: Role::Defender,
+            current_board: Board::try_from(board).expect("Test failed"),
+        };
+        assert_eq!(Threats::Quiet, game.threats());
+        let board = [
+            "...........",
+            "...........",
+            ".X.........",
+            ".X.........",
+            ".X.........",
+            ".X.........",
+            "...........",
+            "O..........",
+            "....K......",
+            "...........",
+            "...........",
+        ];
+        let game = Game {
+            status: Default::default(),
+            previous_boards: Default::default(),
+            turn: Role::Defender,
+            current_board: Board::try_from(board).expect("Test failed"),
+        };
+        assert_eq!(Threats::Quiet, game.threats());
     }
 }

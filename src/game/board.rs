@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -132,10 +132,8 @@ impl Board {
                 .into_iter()
                 .flatten()
             {
-                if !dest.is_restricted() {
-                    if self.get(&dest) == Space::Empty {
-                        return true;
-                    }
+                if !dest.is_restricted() && self.get(&dest) == Space::Empty {
+                    return true;
                 }
             }
         }
@@ -533,7 +531,7 @@ impl Board {
         }
 
         if previous_boards.0.len() >= 100 {
-            return Ok((board, captures, Status::AttackersWin));
+            return Ok((board, captures, Status::Draw));
         }
 
         Ok((board, captures, Status::Ongoing))
@@ -542,11 +540,6 @@ impl Board {
     fn set(&mut self, square: &Square, space: Space) {
         self.spaces[square.y * 11 + square.x] = space;
     }
-}
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LegalMoves {
-    pub role: Role,
-    pub moves: HashMap<Square, Vec<Square>>,
 }
 
 #[cfg(test)]
@@ -900,7 +893,7 @@ mod test_board {
     /// Test that moving an opponents piece is forbidden
     #[test]
     fn test_move_opponents_piece() {
-        let mut board = Board::default();
+        let board = Board::default();
         let err = board
             .play_internal(
                 &Play {
@@ -933,7 +926,7 @@ mod test_board {
     /// Test that moving pieces through other pieces is forbidden
     #[test]
     fn test_moving_through_other_pieces() {
-        let mut board = Board::default();
+        let board = Board::default();
         let err = board
             .play_internal(
                 &Play {
@@ -1005,7 +998,7 @@ mod test_board {
             ".....X.....",
         ];
 
-        let mut board = Board::try_from(board).expect("Test failed");
+        let board = Board::try_from(board).expect("Test failed");
         // passing through throne is allowed
         assert!(
             board
@@ -1132,7 +1125,7 @@ mod test_board {
             ".....O.....",
             "...OOOOO...",
         ];
-        let mut board = Board::try_from(board).expect("Test failed");
+        let board = Board::try_from(board).expect("Test failed");
         let mut previous_boards = PreviousBoards::default();
         previous_boards.0.insert(Board::default());
         // cannot repeat if defender
@@ -1162,7 +1155,7 @@ mod test_board {
             ".O...O.....",
             "...OOOOO...",
         ];
-        let mut board = Board::try_from(board).expect("Test failed");
+        let board = Board::try_from(board).expect("Test failed");
         assert!(
             board
                 .play_internal(
@@ -1194,7 +1187,7 @@ mod test_board {
             ".....O.....",
             "...OOOOO...",
         ];
-        let mut board = Board::try_from(board).expect("Test failed");
+        let board = Board::try_from(board).expect("Test failed");
         let (_, _, status) = board
             .play_internal(
                 &Play {

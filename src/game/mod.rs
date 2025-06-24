@@ -18,6 +18,7 @@ pub enum Status {
     #[default]
     Ongoing,
     DefendersWin,
+    Draw,
 }
 
 impl Display for Status {
@@ -26,6 +27,7 @@ impl Display for Status {
             Status::AttackersWin => f.write_str("Attackers win"),
             Status::Ongoing => f.write_str("Game ongoing"),
             Status::DefendersWin => f.write_str("Defenders win"),
+            Status::Draw => f.write_str("Draw"),
         }
     }
 }
@@ -83,6 +85,7 @@ impl Display for Game {
         self.current_board.fmt(f)
     }
 }
+
 impl Game {
     /// Play a move and update the game state
     pub fn play(&mut self, play: &Play) -> anyhow::Result<()> {
