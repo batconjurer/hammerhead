@@ -1,18 +1,43 @@
-mod backpropogation;
 mod selection;
 mod train;
 
+use std::collections::HashSet;
+use std::fmt::{Debug, Formatter};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use arboriter_mcts::{Action, GameState, Player};
-use candle_core::{Device, Module, Tensor};
+use candle_core::{Module, Tensor};
+//use rayon::prelude::*;
 pub use train::train;
 
 use crate::game::board::Board;
-use crate::game::space::{EXIT_SQUARES, Role, Space, Square};
+use crate::game::space::{EXIT_SQUARES, Role, Square};
 use crate::game::{Play, PreviousBoards, Status};
+use crate::mcts::selection::{NNSelectionPolicy};
 use crate::nn::TaflNNet;
+
+/// Internal representation of a fixed-point value for rewards
+/// This allows atomic operations on floating point rewards
+const REWARD_SCALE: f64 = 1_000_000.0;
+
+/// Safely convert a floating point reward to a scaled integer
+fn float_to_scaled_u64(value: f64) -> u64 {
+    ((value * REWARD_SCALE).max(0.0) as u64).min(u64::MAX / 2)
+}
+
+/// Safely convert a scaled integer back to a floating point reward
+fn scaled_u64_to_float(value: u64) -> f64 {
+    value as f64 / REWARD_SCALE
+}
+
+/// Run Monte Carlo tree search on the given starting position for the given
+/// number of iterations. Return the selection policy afterwards.
+pub fn mcts(root: Game, iterations: usize) {
+    println!("Playing {iterations} games");
+    for _ in 0..iterations {
+        root.simulate_random_playout();
+    }
+}
 
 /// Determine if a position is "quiet" or not.
 /// Currently, we define threats as the ability
@@ -20,23 +45,144 @@ use crate::nn::TaflNNet;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Threats {
     Quiet,
-    Plays(Vec<Play>),
+    Plays(Vec<Game>),
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+
+#[derive(Clone, Default)]
 pub struct Game {
     pub status: Status,
     pub previous_boards: PreviousBoards,
     pub turn: Role,
     pub current_board: Board,
+    pub selection: NNSelectionPolicy,
 }
 
+impl Debug for Game {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Game")
+            .field("status", &self.status)
+            .field("turn", &self.turn)
+            .field("previous_boards", &self.previous_boards.0.len())
+            .field("current_board", &self.current_board.to_string())
+            .finish()
+    }
+}
+impl PartialEq for Game {
+    fn eq(&self, other: &Self) -> bool {
+        self.status == other.status
+            && self.previous_boards == other.previous_boards
+            && self.turn == other.turn
+            && self.current_board == other.current_board
+    }
+}
+impl Eq for Game {}
+
+
 impl Game {
+
+    pub fn new(selection_policy: NNSelectionPolicy) -> Self {
+        Self {
+            selection: selection_policy,
+            ..Default::default()
+        }
+    }
+
+    /// Get a set of child games from this game by checking all
+    /// legal moves. We discard children that are symmetrically
+    /// equivalent to others.
+    pub fn get_children(&self) -> Vec<Game> {
+        let mut normalized_children = HashSet::new();
+        let mut children = vec![];
+        for from in Square::iter() {
+            for to in Square::iter() {
+                let play = Play {
+                    role: self.turn,
+                    from,
+                    to,
+                };
+                let mut game = self.clone();
+                if let Ok((_, status)) =
+                    game.current_board
+                        .play(&play, &game.status, &mut game.previous_boards)
+                {
+                    let mut normalized = game.clone().current_board;
+                    normalized.normalize();
+                    game.status = status;
+                    game.turn = game.turn.opposite();
+                    if normalized_children.insert(normalized) {
+                        children.push(game);
+                    };
+                }
+            }
+        }
+        children
+    }
+
+    fn is_terminal(&self) -> bool {
+        !matches!(self.status, Status::Ongoing)
+    }
+
+    fn get_result(&self, for_player: &Role) -> f64 {
+        match for_player {
+            Role::Attacker => match self.status {
+                Status::AttackersWin => 1.0,
+                Status::DefendersWin => 0.0,
+                Status::Ongoing => unreachable!(),
+                Status::Draw => 0.0,
+            },
+            Role::Defender => match self.status {
+                Status::AttackersWin => 0.0,
+                Status::DefendersWin => 1.0,
+                Status::Ongoing => unreachable!(),
+                Status::Draw => 0.0,
+            },
+        }
+    }
+
+    fn simulate_random_playout(&self) -> f64 {
+        let mut current_state = self.clone();
+        let for_player = self.turn;
+        let mut path = Vec::from([current_state.clone()]);
+        while !current_state.is_terminal() {
+            let legal_actions = match current_state.threats() {
+                Threats::Quiet => current_state.get_children(),
+                Threats::Plays(threats) => threats,
+            };
+            if legal_actions.is_empty() {
+                unreachable!();
+            }
+
+            current_state = legal_actions
+                .into_iter()
+                .max_by(|child1, child2| {
+                    self.selection
+                        .compare_children(&current_state, child1, child2)
+                })
+                .unwrap();
+            path.push(current_state.clone());
+        }
+        if current_state.status == Status::AttackersWin {
+            println!("Attacker victory");
+        }
+        let attacker_rewards = current_state.get_result(&Role::Attacker);
+        let defender_rewards = current_state.get_result(&Role::Defender);
+        for game in path {
+            self.selection
+                .update_stats(&game, attacker_rewards, defender_rewards);
+        }
+        match for_player {
+            Role::Attacker => attacker_rewards,
+            Role::Defender => defender_rewards,
+        }
+    }
+
     /// Return a list of threats. If there are none, label the position
     /// quiet. This is subjective and will be used to tweak the performance
     /// of the final AI in the endgame.
     pub fn threats(&self) -> Threats {
         if let Role::Defender = self.turn {
+            let mut boards = HashSet::with_capacity(4);
             let Some(king) = self.current_board.find_the_king() else {
                 return Threats::Quiet;
             };
@@ -47,12 +193,17 @@ impl Game {
                     from: king,
                     to: corner,
                 };
-                if self
-                    .current_board
-                    .play_internal(&play, &Status::Ongoing, &self.previous_boards)
-                    .is_ok()
+                let mut game = self.clone();
+                if let Ok((_, status)) =
+                    game.current_board
+                        .play(&play, &game.status, &mut game.previous_boards)
                 {
-                    threats.push(play);
+                    game.current_board.normalize();
+                    game.status = status;
+                    game.turn = game.turn.opposite();
+                    if boards.insert(game.current_board.clone()) {
+                        threats.push(game)
+                    }
                 }
             }
             if threats.is_empty() {
@@ -63,117 +214,6 @@ impl Game {
         } else {
             Threats::Quiet
         }
-    }
-}
-
-impl TryFrom<&Game> for Tensor {
-    type Error = candle_core::Error;
-
-    fn try_from(game: &Game) -> Result<Self, Self::Error> {
-        let (attackers, defenders) = Square::iter()
-            .map(|sq| match game.current_board.get(&sq) {
-                Space::Occupied(Role::Attacker) => (1u8, 0u8),
-                Space::Occupied(Role::Defender) => (0, 1),
-                Space::King => (0, 2),
-                Space::Empty => (0, 0),
-            })
-            .unzip::<_, _, Vec<_>, Vec<_>>();
-
-        Tensor::from_vec(
-            attackers
-                .into_iter()
-                .chain(defenders)
-                .chain(
-                    [if game.turn == Role::Attacker {
-                        1u8
-                    } else {
-                        0u8
-                    }; 11 * 11],
-                )
-                .chain([game.previous_boards.0.len() as u8; 11 * 11])
-                .collect(),
-            (4, 11, 11),
-            &Device::Cpu,
-        )
-    }
-}
-
-impl Action for Play {
-    fn id(&self) -> usize {
-        let mut bytes = [0u8; 8];
-        bytes[0] = self.from.x as u8;
-        bytes[1] = self.from.y as u8;
-        bytes[2] = self.to.x as u8;
-        bytes[3] = self.to.y as u8;
-        bytes[4] = match self.role {
-            Role::Attacker => 0,
-            Role::Defender => 1,
-        };
-        usize::from_le_bytes(bytes)
-    }
-}
-
-impl Player for Role {}
-
-impl GameState for Game {
-    type Action = Play;
-    type Player = Role;
-
-    fn get_legal_actions(&self) -> Vec<Self::Action> {
-        let mut legal_actions = vec![];
-        for from in Square::iter() {
-            for to in Square::iter() {
-                let play = Play {
-                    role: self.turn,
-                    from,
-                    to,
-                };
-                if self
-                    .current_board
-                    .play_internal(&play, &self.status, &self.previous_boards)
-                    .is_ok()
-                {
-                    legal_actions.push(play);
-                }
-            }
-        }
-        legal_actions
-    }
-
-    fn apply_action(&self, action: &Self::Action) -> Self {
-        let mut game = self.clone();
-        let (_, status) = game
-            .current_board
-            .play(action, &self.status, &mut game.previous_boards)
-            .expect("The validity of this action should have already been checked");
-        game.status = status;
-        game.turn = game.turn.opposite();
-        game
-    }
-
-    fn is_terminal(&self) -> bool {
-        !matches!(self.status, Status::Ongoing)
-    }
-
-    fn get_result(&self, for_player: &Self::Player) -> f64 {
-        match for_player {
-            Role::Attacker => match self.status {
-                Status::AttackersWin => 1.0,
-                Status::DefendersWin => 0.0,
-                Status::Ongoing => unreachable!(),
-                Status::Draw => 0.5,
-            },
-            Role::Defender => match self.status {
-                Status::AttackersWin => 0.0,
-                Status::DefendersWin => 1.0,
-                Status::Ongoing => unreachable!(),
-                Status::Draw => 0.5,
-            },
-        }
-    }
-
-    fn get_current_player(&self) -> Self::Player {
-        self.turn
     }
 }
 
@@ -212,6 +252,8 @@ impl NNetRole {
             .unwrap()
             .forward(tensor)
             .unwrap()
+            .max(0)
+            .unwrap()
             .to_scalar::<f64>()
             .unwrap()
     }
@@ -220,17 +262,6 @@ impl NNetRole {
     /// given neural network is currently being trained
     fn is_training(nn: Option<&Self>) -> bool {
         matches!(nn, Some(NNetRole::Training(_)))
-    }
-
-    /// Train the neural network to learn the evaluation of the given
-    /// board position
-    fn train(&self, game: &Game, result: f64) {
-        let tensor = Tensor::try_from(game).unwrap();
-        let result = Tensor::new(&[result], &Device::Cpu).unwrap();
-        let Self::Training(nn) = self else { return };
-        let mut guard = nn.lock().unwrap();
-        // TODO! Should we train on board symmetries here as well?
-        guard.train(&tensor, &result, 500).unwrap();
     }
 }
 
@@ -261,11 +292,12 @@ mod tests {
             previous_boards: Default::default(),
             turn: Role::Attacker,
             current_board: Board::try_from(board).expect("Test failed"),
+            selection: Default::default(),
         };
 
         assert_eq!(Threats::Quiet, game.threats());
         game.turn = Role::Defender;
-        let expected = vec![
+        let expected_plays = vec![
             Play {
                 role: Role::Defender,
                 from: Square { x: 0, y: 8 },
@@ -277,7 +309,20 @@ mod tests {
                 to: Square { x: 0, y: 10 },
             },
         ];
-        assert_eq!(Threats::Plays(expected), game.threats());
+        let expected = expected_plays.iter().map(|play| {
+            let mut g = game.clone();
+            g.current_board.play(play, &g.status, &mut g.previous_boards).expect("Test failed");
+            g.current_board.normalize();
+            g.current_board
+        }).collect::<Vec<_>>();
+        let threats = match game.threats() {
+            Threats::Quiet => panic!("Test failed"),
+            Threats::Plays(games) => games.into_iter()
+                .map(|g| g.current_board)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(threats, expected);
         let board = [
             "...........",
             "...........",
@@ -296,13 +341,26 @@ mod tests {
             previous_boards: Default::default(),
             turn: Role::Defender,
             current_board: Board::try_from(board).expect("Test failed"),
+            selection: Default::default(),
         };
-        let expected = vec![Play {
+        let expected_plays = vec![Play {
             role: Role::Defender,
             from: Square { x: 0, y: 8 },
             to: Square { x: 0, y: 10 },
         }];
-        assert_eq!(Threats::Plays(expected), game.threats());
+        let expected = expected_plays.iter().map(|play| {
+            let mut g = game.clone();
+            g.current_board.play(play, &g.status, &mut g.previous_boards).expect("Test failed");
+            g.current_board.normalize();
+            g.current_board
+        }).collect::<Vec<_>>();
+        let threats = match game.threats() {
+            Threats::Quiet => panic!("Test failed"),
+            Threats::Plays(games) => games.into_iter()
+                .map(|g| g.current_board)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(threats, expected);
         let board = [
             "...........",
             "...........",
@@ -321,6 +379,7 @@ mod tests {
             previous_boards: Default::default(),
             turn: Role::Defender,
             current_board: Board::try_from(board).expect("Test failed"),
+            selection: Default::default(),
         };
         assert_eq!(Threats::Quiet, game.threats());
         let board = [
@@ -341,7 +400,9 @@ mod tests {
             previous_boards: Default::default(),
             turn: Role::Defender,
             current_board: Board::try_from(board).expect("Test failed"),
+            selection: Default::default(),
         };
         assert_eq!(Threats::Quiet, game.threats());
     }
+
 }

@@ -7,6 +7,7 @@ use serde_with::serde_as;
 use crate::game::space::{
     BOARD_LETTERS, EXIT_SQUARES, RESTRICTED_SQUARES, Role, Space, Square, THRONE,
 };
+use crate::game::symmetries::{D8, D8Generator};
 use crate::game::{Play, PreviousBoards, Status};
 
 pub const STARTING_POSITION: [&str; 11] = [
@@ -138,6 +139,59 @@ impl Board {
             }
         }
         false
+    }
+
+    pub fn empty() -> Self {
+        Self { spaces: [Space::Empty; 11 * 11]}
+    }
+
+    /// Rotate and / or flip the board so that the king is as close to the origin
+    /// as possible and is below the line y = x. This helps reduce the branching
+    /// at each stage of the game.
+    pub fn normalize(&mut self) {
+        let Some(king) = self.find_the_king() else {
+            return;
+        };
+
+        // first put king on the quadrant closest to the origin
+        if king.x > 5 {
+            let mut board = Self::empty();
+            for square in Square::iter() {
+                let space = self.get(&square);
+                if matches!(space, Space::Occupied(_) | Space::King) {
+                    board.set(
+                        &Square {
+                            x: 10 - square.x,
+                            y: square.y,
+                        },
+                        space,
+                    );
+                }
+            }
+            *self = board;
+        }
+        if king.y > 5 {
+            D8Generator::F.apply(self);
+        }
+        let Some(king) = self.find_the_king() else {
+            return;
+        };
+
+        // then put the king belong the line y = x
+        if king.x < king.y {
+            D8Generator::FR.apply(self)
+        }
+    }
+
+    /// Get all equivalent boards after rotating and flipping
+    pub fn symmetries(&self) -> HashSet<Self> {
+        let mut syms = HashSet::new();
+        for d8_element in D8 {
+            let mut board = self.clone();
+            d8_element.apply(&mut board);
+            syms.insert(board);
+        }
+        syms
     }
 
     /// Find which non-King pieces are captured when player `side` moves
@@ -519,7 +573,9 @@ impl Board {
         }
 
         if previous_boards.0.contains(&board) && play.role == Role::Defender {
-            return Ok((board, captures, Status::AttackersWin));
+            return Err(anyhow::Error::msg(
+                "play: a defender can't repeat a board position",
+            ));
         }
 
         if board.flood_fill_attackers_win() {
@@ -537,7 +593,7 @@ impl Board {
         Ok((board, captures, Status::Ongoing))
     }
 
-    fn set(&mut self, square: &Square, space: Space) {
+    pub fn set(&mut self, square: &Square, space: Space) {
         self.spaces[square.y * 11 + square.x] = space;
     }
 }
@@ -1245,5 +1301,212 @@ mod test_board {
         ];
         let board_after = Board::try_from(board_after).expect("Test failed");
         assert_eq!(board, board_after);
+    }
+
+    /// Test that the normalization of the board is
+    /// correctly computed and is a valid symmetry
+    #[test]
+    fn test_normalize() {
+        let mut board = Board::try_from([
+            "K..........",
+            "...........",
+            ".X.........",
+            ".X.........",
+            ".X.........",
+            ".X.........",
+            "...........",
+            ".X.........",
+            ".X.........",
+            ".X.........",
+            "...........",
+        ]).expect("Test failed");
+        let expected = board.clone();
+        board.normalize();
+        assert_eq!(board, expected);
+
+        let mut board = Board::try_from([
+            "...........",
+            "...........",
+            ".X.........",
+            ".X.........",
+            ".X.........",
+            ".X.........",
+            "...........",
+            ".X.........",
+            ".X.........",
+            ".X.........",
+            "K..........",
+        ]).expect("Test failed");
+        board.normalize();
+        let expected = Board::try_from([
+            "K..........",
+            ".X.........",
+            ".X.........",
+            ".X.........",
+            "...........",
+            ".X.........",
+            ".X.........",
+            ".X.........",
+            ".X.........",
+            "...........",
+            "...........",
+        ]).expect("Test failed");
+        assert_eq!(board, expected);
+
+        let mut board = Board::try_from([
+            "...........",
+            "...........",
+            ".X.........",
+            ".X.........",
+            ".X.........",
+            ".X.........",
+            "...........",
+            ".X.........",
+            ".X.........",
+            ".X........K",
+            "...........",
+        ]).expect("Test failed");
+        board.normalize();
+        let expected = Board::try_from([
+            ".K.........",
+            "...........",
+            "...........",
+            "...........",
+            "...........",
+            "...........",
+            "...........",
+            "...........",
+            "...........",
+            ".XXX.XXXX..",
+            "...........",
+        ]).expect("Test failed");
+        assert_eq!(board, expected);
+    }
+
+    /// Test listing all symmetric equivalents of a board
+    #[test]
+    fn test_symmetries() {
+        let board = Board::default();
+        assert_eq!(HashSet::from([board.clone()]), board.symmetries());
+        let board = Board::try_from([
+            ".K.........",
+            "...........",
+            "...........",
+            "...........",
+            "...........",
+            "...........",
+            "...........",
+            "...........",
+            "...........",
+            "...........",
+            "...........",
+        ]).expect("Test failed");
+        let expected = HashSet::from([
+            Board::try_from([
+                ".K.........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+            ]).expect("Test failed"),
+            Board::try_from([
+                "...........",
+                "K..........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+            ]).expect("Test failed"),
+            Board::try_from([
+                ".........K.",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+            ]).expect("Test failed"),
+            Board::try_from([
+                "...........",
+                "..........K",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+            ]).expect("Test failed"),
+            Board::try_from([
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "K..........",
+                "...........",
+            ]).expect("Test failed"),
+            Board::try_from([
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                ".K.........",
+            ]).expect("Test failed"),
+            Board::try_from([
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "..........K",
+                "...........",
+            ]).expect("Test failed"),
+            Board::try_from([
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                "...........",
+                ".........K.",
+            ]).expect("Test failed"),
+        ]);
+        assert_eq!(expected, board.symmetries());
     }
 }

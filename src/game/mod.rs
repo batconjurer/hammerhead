@@ -8,11 +8,12 @@ use crate::game::space::{Role, Square};
 
 pub mod board;
 pub mod space;
+mod symmetries;
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PreviousBoards(pub FxHashSet<Board>);
 
-#[derive(Copy, Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Copy, Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize, Hash)]
 pub enum Status {
     AttackersWin,
     #[default]

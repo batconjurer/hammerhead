@@ -4,7 +4,7 @@ use std::process::exit;
 use std::str::FromStr;
 
 use clap::{Parser, Subcommand};
-
+use tracing_subscriber::fmt::SubscriberBuilder;
 use crate::game::space::Square;
 use crate::game::{Game, Play, Status};
 
@@ -58,11 +58,15 @@ impl FromStr for GameCommand {
     }
 }
 
+fn init_logging() {
+    SubscriberBuilder::default().with_ansi(true).init();
+}
+
 fn main() {
     let cli = Args::parse();
     match cli.command {
         Commands::Explore => explore(),
-        Commands::Train { iterations } => mcts::train(iterations),
+        Commands::Train { iterations } => mcts::train(iterations as usize),
     }
 }
 

@@ -15,18 +15,15 @@
 //! contains the game metadata.
 use std::path::{Path, PathBuf};
 
-use candle_core::{DType, Device, Module, Shape, Tensor};
+use candle_core::{DType, Device, Module, Tensor};
 use candle_nn::ops::dropout;
-use candle_nn::var_builder::SimpleBackend;
-use candle_nn::{
-    BatchNorm, BatchNormConfig, Conv2d, Conv2dConfig, Init, Linear, Optimizer, VarBuilder, VarMap,
-    batch_norm, conv2d_no_bias, linear_no_bias,
-};
+
+use candle_nn::{BatchNorm, Conv2d, Conv2dConfig, Linear, Optimizer, VarBuilder, VarMap};
 
 /// A trainable DCNN for Hnefatafl
 pub struct TaflNNet {
     convolutions: [NormedConv2d; 4],
-    linear_layers: [NormedLinear; 3],
+    linear_layers: [NormedLinear; 4],
     optimizer: candle_nn::AdamW,
     #[allow(dead_code)]
     backend: PersistentVarMap,
@@ -38,7 +35,7 @@ impl TaflNNet {
         let backend = PersistentVarMap::load_or_new(model_files);
         // the convolution layers
         let convolutions = [
-            NormedConv2d::new(5, 64, 1, &backend),
+            NormedConv2d::new(4, 64, 1, &backend),
             NormedConv2d::new(64, 128, 1, &backend),
             NormedConv2d::new(128, 256, 0, &backend),
             NormedConv2d::new(256, 512, 0, &backend),
@@ -48,6 +45,7 @@ impl TaflNNet {
             NormedLinear::new(512, 1024, true, &backend),
             NormedLinear::new(1024, 2 * 11usize.pow(4), true, &backend),
             NormedLinear::new(2 * 11usize.pow(4), 1, false, &backend),
+            NormedLinear::new(7 * 7, 1, false, &backend),
         ];
         let optimizer = candle_nn::AdamW::new(
             backend.inner.all_vars(),
@@ -78,10 +76,21 @@ impl TaflNNet {
         target: &Tensor,
         epochs: usize,
     ) -> candle_core::Result<()> {
-        for _ in 0..epochs {
-            let output = self.forward(input)?;
-            let loss = candle_nn::loss::mse(&output.squeeze(1)?, target)?;
-            self.optimizer.backward_step(&loss)?;
+        for ep in 0..epochs {
+            let output = self
+                .forward(input)
+                .inspect_err(|e| println!("Could not train on input: {e}"))?;
+            let loss = candle_nn::loss::mse(&output, target)
+                .inspect_err(|e| println!("Could not compute loss: {e}"))?;
+            if ep.rem_euclid(10) == 0 {
+                let o = output.max(0).unwrap().to_scalar::<f64>().unwrap();
+                let t = target.max(0).unwrap().to_scalar::<f64>().unwrap();
+                let l = loss.to_scalar::<f64>().unwrap();
+                println!("Output: {o}, target: {t}, loss: {l}")
+            }
+            self.optimizer
+                .backward_step(&loss)
+                .inspect_err(|e| println!("Could not run optimizer: {e}"))?;
         }
         Ok(())
     }
@@ -89,13 +98,19 @@ impl TaflNNet {
 
 impl Module for TaflNNet {
     fn forward(&self, xs: &Tensor) -> candle_core::Result<Tensor> {
-        let mut xs = xs.reshape((4, 11, 11))?;
+        let mut xs = xs.reshape(((), 4, 11, 11))?;
+        //let mut xs = xs.clone();
         for conv in &self.convolutions {
             xs = conv.forward(&xs)?;
         }
-        for ll in &self.linear_layers {
+        xs = xs.reshape((49, 512))?;
+        for (layer, ll) in self.linear_layers.iter().enumerate() {
             xs = ll.forward(&xs)?;
+            if layer == 2 {
+                xs = xs.reshape((1, 49))?;
+            }
         }
+        xs = xs.reshape(1)?;
         xs.tanh()
     }
 }
@@ -113,39 +128,79 @@ impl NormedConv2d {
         padding: usize,
         backend: &PersistentVarMap,
     ) -> Self {
+        let vb = VarBuilder::from_varmap(&backend.inner, DType::F64, &Device::Cpu);
         Self {
-            conv: conv2d_no_bias(
-                in_channels,
-                out_channels,
-                3,
-                Conv2dConfig {
+            conv: {
+                let init_ws = candle_nn::init::DEFAULT_KAIMING_NORMAL;
+                let cfg = Conv2dConfig {
                     padding,
                     stride: 1,
                     dilation: 1,
                     groups: 1,
                     cudnn_fwd_algo: None,
-                },
-                VarBuilder::from_varmap(&backend.inner, DType::U8, &Device::Cpu),
-            )
-            .unwrap(),
-            norm: batch_norm(
-                64,
-                BatchNormConfig {
-                    eps: 0.00001,
-                    remove_mean: false,
-                    affine: true,
-                    momentum: 0.1,
-                },
-                VarBuilder::from_varmap(&backend.inner, DType::U8, &Device::Cpu),
-            )
-            .unwrap(),
+                };
+                let ws = vb
+                    .get_with_hints(
+                        (out_channels, in_channels / cfg.groups, 3, 3),
+                        // we need to make sure that variable names don't conflict
+                        &format!("conv2d_weight_{in_channels}_{out_channels}"),
+                        init_ws,
+                    )
+                    .unwrap();
+                Conv2d::new(ws, None, cfg)
+            },
+            norm: {
+                use candle_nn::Init;
+
+                let running_mean = vb
+                    .get_with_hints(
+                        out_channels,
+                        &format!("running_mean_convnorm_{out_channels}"),
+                        Init::Const(0.),
+                    )
+                    .unwrap();
+                let running_var = vb
+                    .get_with_hints(
+                        out_channels,
+                        &format!("running_var_convnorm_{out_channels}"),
+                        Init::Const(1.),
+                    )
+                    .unwrap();
+
+                let weight = vb
+                    .get_with_hints(
+                        out_channels,
+                        &format!("weight_convnorm_{out_channels}"),
+                        Init::Const(1.),
+                    )
+                    .unwrap();
+                let bias = vb
+                    .get_with_hints(
+                        out_channels,
+                        &format!("bias_convnorm_{out_channels}"),
+                        Init::Const(0.),
+                    )
+                    .unwrap();
+
+                BatchNorm::new_with_momentum(
+                    out_channels,
+                    running_mean,
+                    running_var,
+                    weight,
+                    bias,
+                    0.00001,
+                    0.1,
+                )
+                .unwrap()
+            },
         }
     }
 }
 
 impl Module for NormedConv2d {
     fn forward(&self, xs: &Tensor) -> candle_core::Result<Tensor> {
-        let xs = self.norm.forward_train(&self.conv.forward(xs)?)?;
+        let xs = self.conv.forward(xs)?;
+        let xs = self.norm.forward_train(&xs)?;
         xs.relu()
     }
 }
@@ -159,24 +214,59 @@ pub struct NormedLinear {
 
 impl NormedLinear {
     pub fn new(in_dim: usize, out_dim: usize, dropout: bool, backend: &PersistentVarMap) -> Self {
+        let vb = VarBuilder::from_varmap(&backend.inner, DType::F64, &Device::Cpu);
         Self {
-            layer: linear_no_bias(
-                in_dim,
-                out_dim,
-                VarBuilder::from_varmap(&backend.inner, DType::U8, &Device::Cpu),
-            )
-            .unwrap(),
-            norm: batch_norm(
-                out_dim,
-                BatchNormConfig {
-                    eps: 0.00001,
-                    remove_mean: false,
-                    affine: true,
-                    momentum: 0.1,
-                },
-                VarBuilder::from_varmap(&backend.inner, DType::U8, &Device::Cpu),
-            )
-            .unwrap(),
+            layer: {
+                let init_ws = candle_nn::init::DEFAULT_KAIMING_NORMAL;
+                let ws = vb
+                    .get_with_hints(
+                        (out_dim, in_dim),
+                        &format!("weight_linear_{in_dim}_{out_dim}"),
+                        init_ws,
+                    )
+                    .unwrap();
+                Linear::new(ws, None)
+            },
+            norm: {
+                use candle_nn::Init;
+
+                let running_mean = vb
+                    .get_with_hints(
+                        out_dim,
+                        &format!("running_mean_linnorm_{out_dim}"),
+                        Init::Const(0.),
+                    )
+                    .unwrap();
+                let running_var = vb
+                    .get_with_hints(
+                        out_dim,
+                        &format!("running_var_linnorm_{out_dim}"),
+                        Init::Const(1.),
+                    )
+                    .unwrap();
+
+                let weight = vb
+                    .get_with_hints(
+                        out_dim,
+                        &format!("weight_linnorm_{out_dim}"),
+                        Init::Const(1.),
+                    )
+                    .unwrap();
+                let bias = vb
+                    .get_with_hints(out_dim, &format!("bias_linnorm_{out_dim}"), Init::Const(0.))
+                    .unwrap();
+
+                BatchNorm::new_with_momentum(
+                    out_dim,
+                    running_mean,
+                    running_var,
+                    weight,
+                    bias,
+                    0.00001,
+                    0.1,
+                )
+                .unwrap()
+            },
             dropout,
         }
     }
@@ -184,7 +274,8 @@ impl NormedLinear {
 
 impl Module for NormedLinear {
     fn forward(&self, xs: &Tensor) -> candle_core::Result<Tensor> {
-        let mut xs = self.norm.forward_train(&self.layer.forward(xs)?)?;
+        let xs = self.layer.forward(xs)?;
+        let mut xs = self.norm.forward_train(&xs)?;
         xs = xs.relu()?;
         if self.dropout {
             xs = dropout(&xs, 0.2)?;
@@ -211,23 +302,6 @@ impl PersistentVarMap {
 
     pub fn save(&self) -> candle_core::Result<()> {
         self.inner.save(&self.path)
-    }
-}
-
-impl SimpleBackend for PersistentVarMap {
-    fn get(
-        &self,
-        s: Shape,
-        name: &str,
-        h: Init,
-        dtype: DType,
-        dev: &Device,
-    ) -> candle_core::Result<Tensor> {
-        <VarMap as SimpleBackend>::get(&self.inner, s, name, h, dtype, dev)
-    }
-
-    fn contains_tensor(&self, name: &str) -> bool {
-        self.inner.contains_tensor(name)
     }
 }
 

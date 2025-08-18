@@ -19,6 +19,8 @@ pub enum Role {
 }
 
 impl Role {
+
+    #[must_use]
     pub fn opposite(&self) -> Self {
         match self {
             Role::Attacker => Role::Defender,
