@@ -5,8 +5,9 @@ use std::sync::{Arc, Mutex};
 use candle_core::{Device, Tensor};
 
 use crate::game::space::Role;
-use crate::mcts::selection::{GameSummary, NNSelectionPolicy, Stats};
-use crate::mcts::{Game, NNetRole, scaled_u64_to_float};
+use crate::game_tree::{GameSummary, GameTreeNode};
+use crate::mcts::selection::{NNSelectionPolicy, Stats};
+use crate::mcts::{NNetRole, scaled_i64_to_float};
 
 pub const ATTACKER_NN_FILE_PREFIX: &str = "hnefatafl_attacker";
 pub const DEFENDER_NN_FILE_PREFIX: &str = "hnefatafl_defender";
@@ -22,10 +23,9 @@ pub fn train(iterations: usize) {
             exploration_constant: 1.414,
             stats_map: stats.clone(),
         };
-        let game = Game::new(selection_policy);
-        let _ = crate::mcts::mcts(game, iterations);
+        let game = GameTreeNode::new();
+        let _ = crate::mcts::mcts(&game, &selection_policy, iterations);
         println!("Finished search");
-        println!("Stats pointer: {}", Arc::strong_count(&stats));
         let stats = Arc::into_inner(stats).unwrap().into_inner().unwrap();
         backpropagate(defender_nn, &stats);
     }
@@ -39,8 +39,8 @@ pub fn train(iterations: usize) {
             exploration_constant: 1.414,
             stats_map: stats.clone(),
         };
-        let game = Game::new(selection_policy);
-        let _ = crate::mcts::mcts(game, iterations);
+        let game = GameTreeNode::new();
+        let _ = crate::mcts::mcts(&game, &selection_policy, iterations);
         let stats = Arc::into_inner(stats).unwrap().into_inner().unwrap();
         backpropagate(attacker_nn, &stats);
     }
@@ -59,7 +59,7 @@ fn backpropagate(nn: NNetRole, stats: &HashMap<GameSummary, Stats>) {
                 ..game_pos.clone()
             };
             let tensor = Tensor::try_from(&game).unwrap();
-            let rewards = scaled_u64_to_float(match game.turn {
+            let rewards = scaled_i64_to_float(match game.turn {
                 Role::Attacker => stats.attacker_rewards.load(Ordering::Relaxed),
                 Role::Defender => stats.defender_rewards.load(Ordering::Relaxed),
             });

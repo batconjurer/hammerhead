@@ -6,11 +6,13 @@ use std::str::FromStr;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::fmt::SubscriberBuilder;
 use crate::game::space::Square;
-use crate::game::{Game, Play, Status};
+use crate::game::{LiveGame, Play, Status};
 
 mod game;
 mod mcts;
 mod nn;
+mod alpha_beta;
+mod game_tree;
 
 #[derive(Parser)]
 #[command(version, about, long_about=None)]
@@ -58,6 +60,7 @@ impl FromStr for GameCommand {
     }
 }
 
+#[allow(dead_code)]
 fn init_logging() {
     SubscriberBuilder::default().with_ansi(true).init();
 }
@@ -92,7 +95,7 @@ fn user_input() -> GameCommand {
 }
 
 fn explore() {
-    let mut game = Game::default();
+    let mut game = LiveGame::default();
     loop {
         println!("{}", game);
         match user_input() {

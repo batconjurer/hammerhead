@@ -69,8 +69,9 @@ impl Play {
     }
 }
 
+/// A UI friendly version of a game for playing on the CLI
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct Game {
+pub struct LiveGame {
     pub status: Status,
     pub previous_boards: PreviousBoards,
     pub history: Vec<Board>,
@@ -79,7 +80,7 @@ pub struct Game {
     pub current_board: Board,
 }
 
-impl Display for Game {
+impl Display for LiveGame {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.write_str(&format!("Status: {}\n", self.status))?;
         f.write_str(&format!("Turn: {}\n", self.turn))?;
@@ -87,7 +88,7 @@ impl Display for Game {
     }
 }
 
-impl Game {
+impl LiveGame {
     /// Play a move and update the game state
     pub fn play(&mut self, play: &Play) -> anyhow::Result<()> {
         let current = self.current_board.clone();
