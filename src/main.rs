@@ -3,16 +3,16 @@ use std::io::Write;
 use std::process::exit;
 use std::str::FromStr;
 
+use crate::game::space::{Role, Square};
+use crate::game::{EngineRole, LiveGame, Play, Status};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::fmt::SubscriberBuilder;
-use crate::game::space::Square;
-use crate::game::{LiveGame, Play, Status};
 
+mod alpha_beta;
 mod game;
+mod game_tree;
 mod mcts;
 mod nn;
-mod alpha_beta;
-mod game_tree;
 
 #[derive(Parser)]
 #[command(version, about, long_about=None)]
@@ -25,6 +25,8 @@ struct Args {
 enum Commands {
     #[command(about = "Make moves on a board in a non-game setting.")]
     Explore,
+    #[command(about = "Play against a rudimentary AI")]
+    Play { role: Role },
     #[command(about = "Train an AI via self play.")]
     Train {
         #[arg(help = "The number of improved versions to create.")]
@@ -68,9 +70,13 @@ fn init_logging() {
 fn main() {
     let cli = Args::parse();
     match cli.command {
-        Commands::Explore => explore(),
+        Commands::Explore => explore(None),
         Commands::Train { iterations } => mcts::train(iterations as usize),
+        Commands::Play { role } => explore(Some(role)),
     }
+    // let mut game = LiveGame::default();
+    // game.engine = Some(EngineRole::from(Role::Attacker));
+    // game.engine_play();
 }
 
 fn user_input() -> GameCommand {
@@ -94,9 +100,13 @@ fn user_input() -> GameCommand {
     }
 }
 
-fn explore() {
-    let mut game = LiveGame::default();
+fn explore(role: Option<Role>) {
+    let mut game = LiveGame {
+        engine: role.map(|r| EngineRole::from(r.opposite())),
+        ..Default::default()
+    };
     loop {
+        game.engine_play();
         println!("{}", game);
         match user_input() {
             GameCommand::Undo => game.undo(),

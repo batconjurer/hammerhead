@@ -5,10 +5,10 @@ use std::sync::{Arc, Mutex};
 
 use candle_core::{Device, Tensor};
 
-use crate::game::space::{Role, Space, Square};
 use crate::game::Status;
+use crate::game::space::{Role, Space, Square};
 use crate::game_tree::{GameSummary, GameTreeNode, SelectionPolicy};
-use crate::mcts::{float_to_scaled_i64, NNetRole, scaled_i64_to_float};
+use crate::mcts::{NNetRole, float_to_scaled_i64, scaled_i64_to_float};
 
 #[derive(Default, Debug)]
 pub struct Stats {
@@ -91,7 +91,6 @@ impl Default for NNSelectionPolicy {
 }
 
 impl NNSelectionPolicy {
-
     /// The heuristic value from MCTS to be used when a neural network
     /// is not present
     pub fn fallback_eval(&self, child: &GameTreeNode) -> f64 {
@@ -106,12 +105,12 @@ impl NNSelectionPolicy {
                 Status::AttackersWin => match child.turn {
                     Role::Attacker => 1.0,
                     Role::Defender => -1.0,
-                }
+                },
                 Status::DefendersWin => match child.turn {
                     Role::Attacker => -1.0,
                     Role::Defender => 1.0,
-                }
-                Status::Draw | Status::Ongoing => 0.0
+                },
+                Status::Draw | Status::Ongoing => 0.0,
             }
         };
         base
@@ -162,18 +161,22 @@ impl SelectionPolicy for NNSelectionPolicy {
 
     fn eval_attacker(&self, child: &GameTreeNode) -> i64 {
         let tensor = (&GameSummary::from(child)).try_into().unwrap();
-        float_to_scaled_i64(self.attacker_nn
-            .as_ref()
-            .map(|nn| nn.eval(&tensor))
-            .unwrap_or_else(|| self.fallback_eval(child)))
+        float_to_scaled_i64(
+            self.attacker_nn
+                .as_ref()
+                .map(|nn| nn.eval(&tensor))
+                .unwrap_or_else(|| self.fallback_eval(child)),
+        )
     }
 
     fn eval_defender(&self, child: &GameTreeNode) -> i64 {
         let tensor = (&GameSummary::from(child)).try_into().unwrap();
-        float_to_scaled_i64(self.defender_nn
-            .as_ref()
-            .map(|nn| nn.eval(&tensor))
-            .unwrap_or_else(|| self.fallback_eval(child)))
+        float_to_scaled_i64(
+            self.defender_nn
+                .as_ref()
+                .map(|nn| nn.eval(&tensor))
+                .unwrap_or_else(|| self.fallback_eval(child)),
+        )
     }
 
     fn compare_children(

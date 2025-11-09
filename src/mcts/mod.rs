@@ -8,10 +8,10 @@ use candle_core::{Module, Tensor};
 //use rayon::prelude::*;
 pub use train::train;
 
-use crate::game::space::Role;
 use crate::game::Status;
+use crate::game::space::Role;
 use crate::game_tree::GameTreeNode;
-use crate::mcts::selection::{NNSelectionPolicy};
+use crate::mcts::selection::NNSelectionPolicy;
 use crate::nn::TaflNNet;
 
 /// Internal representation of a fixed-point value for rewards
@@ -25,14 +25,14 @@ pub fn float_to_scaled_i64(value: f64) -> i64 {
 
 /// Safely convert a scaled integer back to a floating point reward
 pub fn scaled_i64_to_float(value: i64) -> f64 {
-    (value  as f64) / REWARD_SCALE
+    (value as f64) / REWARD_SCALE
 }
 /// Run Monte Carlo tree search on the given starting position for the given
 /// number of iterations. Return the selection policy afterwards.
 pub fn mcts(root: &GameTreeNode, policy: &NNSelectionPolicy, iterations: usize) {
     println!("Playing {iterations} games");
     for _ in 0..iterations {
-        simulate_random_playout(&root, policy);
+        simulate_random_playout(root, policy);
     }
 }
 pub fn simulate_random_playout(node: &GameTreeNode, policy: &NNSelectionPolicy) -> f64 {
@@ -49,15 +49,13 @@ pub fn simulate_random_playout(node: &GameTreeNode, policy: &NNSelectionPolicy) 
     let attacker_rewards = current_state.get_result(&Role::Attacker);
     let defender_rewards = current_state.get_result(&Role::Defender);
     for game in path {
-        policy
-            .update_stats(&game, attacker_rewards, defender_rewards);
+        policy.update_stats(&game, attacker_rewards, defender_rewards);
     }
     match for_player {
         Role::Attacker => attacker_rewards,
         Role::Defender => defender_rewards,
     }
 }
-
 
 /// An enum indicating whether a [`TaflNNet`] is being
 /// trained or simply being used to play.
@@ -110,9 +108,9 @@ impl NNetRole {
 #[cfg(test)]
 mod tests {
 
-    use crate::game::Play;
     use crate::game::board::Board;
     use crate::game::space::{Role, Square};
+    use crate::game::{Play, PositionsTracker};
     use crate::game_tree::{GameTreeNode, Threats};
 
     #[test]
@@ -132,7 +130,7 @@ mod tests {
         ];
         let mut game = GameTreeNode {
             status: Default::default(),
-            previous_boards: Default::default(),
+            previous_boards: PositionsTracker::Counter(0),
             turn: Role::Attacker,
             current_board: Board::try_from(board).expect("Test failed"),
         };
@@ -151,17 +149,23 @@ mod tests {
                 to: Square { x: 0, y: 10 },
             },
         ];
-        let expected = expected_plays.iter().map(|play| {
-            let mut g = game.clone();
-            g.current_board.play(play, &g.status, &mut g.previous_boards).expect("Test failed");
-            g.current_board.normalize();
-            g.current_board
-        }).collect::<Vec<_>>();
+        let expected = expected_plays
+            .iter()
+            .map(|play| {
+                let mut g = game.clone();
+                g.current_board
+                    .play(play, &g.status, &mut g.previous_boards)
+                    .expect("Test failed");
+                g.current_board.normalize();
+                g.current_board
+            })
+            .collect::<Vec<_>>();
         let threats = match game.threats() {
             Threats::Quiet => panic!("Test failed"),
-            Threats::Plays(games) => games.into_iter()
+            Threats::Plays(games) => games
+                .into_iter()
                 .map(|g| g.current_board)
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>(),
         };
 
         assert_eq!(threats, expected);
@@ -180,7 +184,7 @@ mod tests {
         ];
         let game = GameTreeNode {
             status: Default::default(),
-            previous_boards: Default::default(),
+            previous_boards: PositionsTracker::Counter(0),
             turn: Role::Defender,
             current_board: Board::try_from(board).expect("Test failed"),
         };
@@ -189,17 +193,23 @@ mod tests {
             from: Square { x: 0, y: 8 },
             to: Square { x: 0, y: 10 },
         }];
-        let expected = expected_plays.iter().map(|play| {
-            let mut g = game.clone();
-            g.current_board.play(play, &g.status, &mut g.previous_boards).expect("Test failed");
-            g.current_board.normalize();
-            g.current_board
-        }).collect::<Vec<_>>();
+        let expected = expected_plays
+            .iter()
+            .map(|play| {
+                let mut g = game.clone();
+                g.current_board
+                    .play(play, &g.status, &mut g.previous_boards)
+                    .expect("Test failed");
+                g.current_board.normalize();
+                g.current_board
+            })
+            .collect::<Vec<_>>();
         let threats = match game.threats() {
             Threats::Quiet => panic!("Test failed"),
-            Threats::Plays(games) => games.into_iter()
+            Threats::Plays(games) => games
+                .into_iter()
                 .map(|g| g.current_board)
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>(),
         };
         assert_eq!(threats, expected);
         let board = [
@@ -217,7 +227,7 @@ mod tests {
         ];
         let game = GameTreeNode {
             status: Default::default(),
-            previous_boards: Default::default(),
+            previous_boards: PositionsTracker::Counter(0),
             turn: Role::Defender,
             current_board: Board::try_from(board).expect("Test failed"),
         };
@@ -237,7 +247,7 @@ mod tests {
         ];
         let game = GameTreeNode {
             status: Default::default(),
-            previous_boards: Default::default(),
+            previous_boards: PositionsTracker::Counter(0),
             turn: Role::Defender,
             current_board: Board::try_from(board).expect("Test failed"),
         };

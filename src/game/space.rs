@@ -19,7 +19,6 @@ pub enum Role {
 }
 
 impl Role {
-
     #[must_use]
     pub fn opposite(&self) -> Self {
         match self {
@@ -168,6 +167,11 @@ impl Square {
         RESTRICTED_SQUARES.contains(self)
     }
 
+    /// Checks if the square is one of the corners
+    pub fn is_exit(&self) -> bool {
+        EXIT_SQUARES.contains(self)
+    }
+
     #[must_use]
     pub fn up(&self) -> Option<Square> {
         if self.y > 0 {
@@ -245,6 +249,169 @@ impl Iterator for SquareIter {
     }
 }
 
+#[derive(Default)]
+pub struct DefenderIter(Option<Square>);
+
+impl Iterator for DefenderIter {
+    type Item = Square;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        const OUTER_LIMITS: [usize; 6] = [0, 1, 2, 8, 9, 10];
+        match self.0.as_mut() {
+            // Start out on the outer 3 layers
+            None => self.0 = Some(Square { x: 3, y: 3 }),
+            Some(sq) => {
+                // if we are in the top or bottom 3 rows...
+                if sq.y < 10 && OUTER_LIMITS.contains(&sq.x) {
+                    sq.y += 1;
+                } else if sq.y < 10 {
+                    // if we are in the 3rd column, we just over the inner square
+                    if sq.y == 2 {
+                        sq.y = 8;
+                    } else if sq.y == 7 {
+                        // if we are in the 8th column and 8th row, we
+                        // start iterating the outer layer
+                        if sq.x == 7 {
+                            sq.x = 0;
+                            sq.y = 0;
+                        } else {
+                            // if we are in the 8th column, we are iterating over
+                            // the inner square
+                            sq.y = 3;
+                            sq.x += 1;
+                        }
+                    } else {
+                        // not in an edge condition, just advance
+                        sq.y += 1;
+                    }
+                } else if sq.x == 10 {
+                    // we have finished the outer layers, we are done
+                    return None;
+                } else {
+                    // start over at the next row
+                    sq.y = 0;
+                    sq.x += 1;
+                }
+            }
+        }
+        self.0
+    }
+}
+
+#[derive(Default)]
+pub struct AttackerIter(Option<Square>);
+
+impl Iterator for AttackerIter {
+    type Item = Square;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        const OUTER_LIMITS: [usize; 6] = [0, 1, 2, 8, 9, 10];
+        match self.0.as_mut() {
+            // Start out on the outer 3 layers
+            None => self.0 = Some(Square { x: 0, y: 1 }),
+            Some(sq) => {
+                // if we are in the top or bottom 3 rows...
+                if sq.y < 10 && OUTER_LIMITS.contains(&sq.x) {
+                    sq.y += 1;
+                } else if sq.y < 10 {
+                    // if we are in the 3rd column, we just over the inner square
+                    if sq.y == 2 {
+                        sq.y = 8;
+                    } else if sq.y == 7 {
+                        // if we are in the 8th column and 8th row, we are done
+                        if sq.x == 7 {
+                            return None;
+                        } else {
+                            // if we are in the 8th column, we are iterating over
+                            // the inner square
+                            sq.y = 3;
+                            sq.x += 1;
+                        }
+                    } else {
+                        // not in an edge condition, just advance
+                        sq.y += 1;
+                    }
+                } else if sq.x == 10 {
+                    // we have finished the outer layers,
+                    // now iterator over the inner square
+                    sq.x = 3;
+                    sq.y = 3;
+                } else {
+                    // start over at the next row
+                    sq.y = 0;
+                    sq.x += 1;
+                }
+            }
+        }
+        // we don't need to yield restricted squares
+        if self.0.unwrap().is_restricted() {
+            self.next()
+        } else {
+            self.0
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct SquareMap<T> {
+    inner: [Option<T>; 121],
+}
+
+impl<T> Default for SquareMap<T> {
+    fn default() -> Self {
+        Self {
+            inner: [const { None }; 121],
+        }
+    }
+}
+
+impl<T> SquareMap<T> {
+    pub fn contains_key(&self, key: &Square) -> bool {
+        self.inner[key.y * 11 + key.x].is_some()
+    }
+
+    pub fn get(&self, key: &Square) -> Option<&T> {
+        let ix = key.y * 11 + key.x;
+        self.inner[ix].as_ref()
+    }
+
+    pub fn insert(&mut self, key: Square, value: T) {
+        let ix = key.y * 11 + key.x;
+        self.inner[ix] = Some(value);
+    }
+}
+
+pub type SquareSet = SquareMap<()>;
+
+impl SquareSet {
+    pub fn contains(&self, key: &Square) -> bool {
+        self.contains_key(key)
+    }
+
+    pub fn add(&mut self, key: Square) {
+        self.insert(key, ());
+    }
+}
+
+impl<A> FromIterator<(Square, A)> for SquareMap<A> {
+    fn from_iter<T: IntoIterator<Item = (Square, A)>>(iter: T) -> Self {
+        let mut map = SquareMap::default();
+        for (key, value) in iter {
+            map.insert(key, value);
+        }
+        map
+    }
+}
+
+impl<A, T> From<A> for SquareMap<T>
+where
+    A: IntoIterator<Item = (Square, T)>,
+{
+    fn from(iter: A) -> Self {
+        Self::from_iter(iter)
+    }
+}
+
 #[cfg(test)]
 mod test_spaces {
     use super::*;
@@ -283,5 +450,55 @@ mod test_spaces {
         assert_eq!(Square { x: 0, y: 0 }.to_string(), "A11");
         assert_eq!(Square { x: 4, y: 6 }.to_string(), "E5");
         assert_eq!(Square { x: 5, y: 5 }.to_string(), "F6");
+    }
+
+    /// Test that the [`AttackIter`] yeilds values in the outer
+    /// three layers first and yields no restricted squares.
+    #[test]
+    fn test_attacker_iter() {
+        const OUTER_VALUES: usize = 121 - 25 - 4;
+        const INNER_VALUES: usize = 25 - 1;
+        const OUTER_LIMITS: [usize; 6] = [0, 1, 2, 8, 9, 10];
+
+        let mut iter = AttackerIter::default();
+        let mut visited = HashSet::new();
+        for _ in 0..OUTER_VALUES {
+            let next = iter.next().expect("Test failed");
+            assert!(OUTER_LIMITS.contains(&next.x) || OUTER_LIMITS.contains(&next.y));
+            assert!(!next.is_restricted());
+            assert!(visited.insert(next));
+        }
+        for _ in 0..INNER_VALUES {
+            let next = iter.next().expect("Test failed");
+            assert!(!OUTER_LIMITS.contains(&next.x) && !OUTER_LIMITS.contains(&next.y));
+            assert!(!next.is_restricted());
+            assert!(visited.insert(next));
+        }
+        assert_eq!(visited.len(), 121 - 5);
+    }
+
+    /// Test that the [`DefenderIter`] yields values in the inner 5 x 5
+    /// square first.
+    #[test]
+    fn test_defender_iter() {
+        const OUTER_VALUES: usize = 121 - 25;
+        const INNER_VALUES: usize = 25;
+        const OUTER_LIMITS: [usize; 6] = [0, 1, 2, 8, 9, 10];
+
+        let mut iter = DefenderIter::default();
+        let mut visited = HashSet::new();
+
+        for _ in 0..INNER_VALUES {
+            let next = iter.next().expect("Test failed");
+            assert!(!OUTER_LIMITS.contains(&next.x) && !OUTER_LIMITS.contains(&next.y));
+            assert!(visited.insert(next));
+        }
+        for _ in 0..OUTER_VALUES {
+            let next = iter.next().expect("Test failed");
+            assert!(OUTER_LIMITS.contains(&next.x) || OUTER_LIMITS.contains(&next.y));
+            assert!(visited.insert(next));
+        }
+
+        assert_eq!(visited.len(), 121);
     }
 }

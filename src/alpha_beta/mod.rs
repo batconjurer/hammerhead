@@ -1,3 +1,5 @@
+pub mod heuristic;
+
 use std::hash::Hash;
 use std::marker::PhantomData;
 
@@ -31,7 +33,6 @@ pub trait GameNode: Sized {
 impl GameNode for GameTreeNode {
     type Convert = ChildIterator;
 
-
     fn turn(&self) -> Role {
         self.turn
     }
@@ -64,33 +65,33 @@ struct AlphaBetaNode<P, N, I>
 where
     for<'a> P: ParentNode<'a, N>,
     I: InternalNode<N>,
-    N: GameNode<Convert=I>,
+    N: GameNode<Convert = I>,
 {
     parent: P,
     internal_node: I,
     peeked: Option<Peeked<P, N, I>>,
     depth: usize,
-    _phantom: PhantomData<N>
+    _phantom: PhantomData<N>,
 }
 
 /// Indirection to avoid recursive types
-struct Peeked <P, N, I>
+struct Peeked<P, N, I>
 where
     for<'a> P: ParentNode<'a, N>,
     I: InternalNode<N>,
-    N: GameNode<Convert=I>,
+    N: GameNode<Convert = I>,
 {
     parent: P,
     internal_node: I,
     depth: usize,
-    _phantom: PhantomData<N>
+    _phantom: PhantomData<N>,
 }
 
 impl<P, N, I> From<Peeked<P, N, I>> for AlphaBetaNode<P, N, I>
 where
     for<'a> P: ParentNode<'a, N>,
     I: InternalNode<N>,
-    N: GameNode<Convert=I>,
+    N: GameNode<Convert = I>,
 {
     fn from(peeked: Peeked<P, N, I>) -> Self {
         Self {
@@ -107,7 +108,7 @@ impl<P, N, I> AlphaBetaNode<P, N, I>
 where
     for<'a> P: ParentNode<'a, N>,
     I: InternalNode<N>,
-    N: GameNode<Convert=I>,
+    N: GameNode<Convert = I>,
 {
     fn turn(&self) -> Role {
         self.internal_node.node().turn()
@@ -118,21 +119,24 @@ where
     }
 
     /// Get the next child of this node and store it (if it exists)
-     fn peek(&mut self) -> bool {
-         if self.peeked.is_none() {
-             let Some(child) = self.internal_node.next() else {
-                 return false
-             };
-             let parent = P::from(self.node());
-             self.peeked = Some(Peeked {
-                 parent: parent.clone(),
-                 internal_node: child.convert(),
-                 depth: self.depth - 1,
-                 _phantom: Default::default(),
-             });
-         }
-         self.peeked.is_some()
-     }
+    fn peek(&mut self) -> bool {
+        if self.peeked.is_none() {
+            let Some(child) = self.internal_node.next() else {
+                return false;
+            };
+            if self.depth == 0 {
+                return false;
+            }
+            let parent = P::from(self.node());
+            self.peeked = Some(Peeked {
+                parent: parent.clone(),
+                internal_node: child.convert(),
+                depth: self.depth - 1,
+                _phantom: Default::default(),
+            });
+        }
+        self.peeked.is_some()
+    }
 
     fn next_child(&mut self) -> Option<Self> {
         _ = self.peek();
@@ -156,27 +160,26 @@ where
         self.depth == 0 || self.node().is_terminal()
     }
 }
-pub fn alphabeta<P, N, I>(root: &N, policy: &impl SelectionPolicy<TreeNode = N>, depth: usize) -> i64
+
+pub fn alphabeta<P, N, I>(
+    root: &N,
+    policy: &impl SelectionPolicy<TreeNode = N>,
+    depth: usize,
+) -> i64
 where
-        for<'a> P: ParentNode<'a, N>,
-        I: InternalNode<N>,
-        N: GameNode<Convert=I>,
+    for<'a> P: ParentNode<'a, N>,
+    I: InternalNode<N>,
+    N: GameNode<Convert = I>,
 {
     if depth == 0 {
         return match root.turn() {
             Role::Attacker => policy.eval_attacker(root),
             Role::Defender => policy.eval_defender(root),
-        }
+        };
     }
     let mut alphas: FxHashMap<P, i64> = FxHashMap::default();
-    let mut betas:FxHashMap<P, i64> = FxHashMap::default();
-    alphabeta_inner(
-        root,
-        policy,
-        &mut alphas,
-        &mut betas,
-        depth,
-    )
+    let mut betas: FxHashMap<P, i64> = FxHashMap::default();
+    alphabeta_inner(root, policy, &mut alphas, &mut betas, depth)
 }
 
 fn alphabeta_inner<P, N, I>(
@@ -184,14 +187,13 @@ fn alphabeta_inner<P, N, I>(
     policy: &impl SelectionPolicy<TreeNode = N>,
     alphas: &mut FxHashMap<P, i64>,
     betas: &mut FxHashMap<P, i64>,
-    depth: usize
+    depth: usize,
 ) -> i64
 where
     for<'a> P: ParentNode<'a, N>,
     I: InternalNode<N>,
-    N: GameNode<Convert=I>,
+    N: GameNode<Convert = I>,
 {
-
     alphas.insert(P::from(root), i64::MIN);
     betas.insert(P::from(root), i64::MAX);
 
@@ -206,7 +208,14 @@ where
             peeked: None,
             _phantom: Default::default(),
         });
+    }
 
+    // handle the case when the root is also a leaf
+    if queue.is_empty() {
+        return match root.turn() {
+            Role::Attacker => policy.eval_attacker(root),
+            Role::Defender => policy.eval_defender(root),
+        };
     }
     let mut last_tree_depth = depth;
     while let Some(mut ab_node) = queue.pop() {
@@ -223,7 +232,8 @@ where
                     let eval = if ab_node.is_leaf() {
                         ab_node.eval(policy)
                     } else {
-                        *betas.get(&P::from(ab_node.node()))
+                        *betas
+                            .get(&P::from(ab_node.node()))
                             .expect("A child evaluation was missing when backtracking up the tree")
                     };
                     // if a full child subtree has been explored or we hit a cutoff,
@@ -240,7 +250,8 @@ where
                     let eval = if ab_node.is_leaf() {
                         ab_node.eval(policy)
                     } else {
-                        *alphas.get(&P::from(ab_node.node()))
+                        *alphas
+                            .get(&P::from(ab_node.node()))
                             .expect("A child evaluation was missing when backtracking up the tree")
                     };
                     if *parent_eval <= eval || ab_node.exhausted() {
@@ -265,11 +276,13 @@ where
                 // initialize the alpha / beta value for this node in the table if necessary
                 let child_key = P::from(child.node());
 
-                let parent_alpha = *alphas.get(&P::from(ab_node.node()))
+                let parent_alpha = *alphas
+                    .get(&P::from(ab_node.node()))
                     .expect("Cannot visit a child before its parent");
                 alphas.insert(child_key.clone(), parent_alpha);
 
-                let parent_beta =*betas.get(&P::from(ab_node.node()))
+                let parent_beta = *betas
+                    .get(&P::from(ab_node.node()))
                     .expect("Cannot visit a child before its parent");
                 betas.insert(child_key, parent_beta);
 
@@ -289,13 +302,12 @@ where
     }
 }
 
-
 #[cfg(test)]
 mod test_alphabeta {
+    use super::*;
     use std::cell::RefCell;
     use std::cmp::Ordering;
     use std::collections::HashSet;
-    use super::*;
 
     #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
     pub struct TestTreeNode {
@@ -307,7 +319,7 @@ mod test_alphabeta {
 
     #[derive(Debug, Copy, Clone)]
     pub struct TestInternal {
-        node : TestTreeNode,
+        node: TestTreeNode,
         next_child: Option<bool>,
     }
 
@@ -366,7 +378,6 @@ mod test_alphabeta {
     }
 
     impl From<&TestTreeNode> for TestTreeNode {
-
         fn from(value: &TestTreeNode) -> Self {
             value.clone()
         }
@@ -425,12 +436,45 @@ mod test_alphabeta {
             &self,
             _: &Self::TreeNode,
             child1: &Self::TreeNode,
-            child2: &Self::TreeNode
+            child2: &Self::TreeNode,
         ) -> Ordering {
             let eval1 = self.evaluations[child1.label];
             let eval2 = self.evaluations[child2.label];
             eval1.cmp(&eval2)
         }
+    }
+
+    /// Test basic depth 0 and 1 trees
+    #[test]
+    fn test_shallow_trees() {
+        let root = TestTreeNode {
+            level: 0,
+            label: 0,
+            is_left: false,
+            max_level: 0,
+        };
+        let policy = PolicyVector {
+            queries: Default::default(),
+            evaluations: vec![10],
+        };
+        let mut alphas: FxHashMap<TestTreeNode, i64> = FxHashMap::default();
+        let mut betas: FxHashMap<TestTreeNode, i64> = FxHashMap::default();
+        let res = alphabeta_inner(&root, &policy, &mut alphas, &mut betas, 3);
+        assert_eq!(res, 10);
+        let root = TestTreeNode {
+            level: 0,
+            label: 0,
+            is_left: false,
+            max_level: 1,
+        };
+        let policy = PolicyVector {
+            queries: Default::default(),
+            evaluations: vec![1, 2],
+        };
+        let mut alphas: FxHashMap<TestTreeNode, i64> = FxHashMap::default();
+        let mut betas: FxHashMap<TestTreeNode, i64> = FxHashMap::default();
+        let res = alphabeta_inner(&root, &policy, &mut alphas, &mut betas, 3);
+        assert_eq!(res, 2);
     }
 
     #[test]
@@ -439,7 +483,7 @@ mod test_alphabeta {
             level: 0,
             label: 0,
             is_left: false,
-            max_level: 3,
+            max_level: 5,
         };
 
         let policy = PolicyVector {
@@ -448,14 +492,8 @@ mod test_alphabeta {
         };
 
         let mut alphas: FxHashMap<TestTreeNode, i64> = FxHashMap::default();
-        let mut betas:FxHashMap<TestTreeNode, i64> = FxHashMap::default();
-        let res = alphabeta_inner(
-            &root,
-            &policy,
-            &mut alphas,
-            &mut betas,
-            3,
-        );
+        let mut betas: FxHashMap<TestTreeNode, i64> = FxHashMap::default();
+        let res = alphabeta_inner(&root, &policy, &mut alphas, &mut betas, 3);
 
         assert_eq!(res, 3);
         let mut expected = HashSet::from([0, 1, 2, 4, 5]);
@@ -469,6 +507,5 @@ mod test_alphabeta {
         let val = betas.remove(&root).expect("Test failed");
         assert_eq!(val, i64::MAX);
         assert!(betas.is_empty());
-
     }
 }

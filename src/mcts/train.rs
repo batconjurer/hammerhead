@@ -2,12 +2,12 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
-use candle_core::{Device, Tensor};
-
+use crate::game::PositionsTracker;
 use crate::game::space::Role;
 use crate::game_tree::{GameSummary, GameTreeNode};
 use crate::mcts::selection::{NNSelectionPolicy, Stats};
 use crate::mcts::{NNetRole, scaled_i64_to_float};
+use candle_core::{Device, Tensor};
 
 pub const ATTACKER_NN_FILE_PREFIX: &str = "hnefatafl_attacker";
 pub const DEFENDER_NN_FILE_PREFIX: &str = "hnefatafl_defender";
@@ -23,8 +23,8 @@ pub fn train(iterations: usize) {
             exploration_constant: 1.414,
             stats_map: stats.clone(),
         };
-        let game = GameTreeNode::new();
-        let _ = crate::mcts::mcts(&game, &selection_policy, iterations);
+        let game = GameTreeNode::new(PositionsTracker::Counter(0));
+        crate::mcts::mcts(&game, &selection_policy, iterations);
         println!("Finished search");
         let stats = Arc::into_inner(stats).unwrap().into_inner().unwrap();
         backpropagate(defender_nn, &stats);
@@ -39,8 +39,8 @@ pub fn train(iterations: usize) {
             exploration_constant: 1.414,
             stats_map: stats.clone(),
         };
-        let game = GameTreeNode::new();
-        let _ = crate::mcts::mcts(&game, &selection_policy, iterations);
+        let game = GameTreeNode::new(PositionsTracker::Counter(0));
+        crate::mcts::mcts(&game, &selection_policy, iterations);
         let stats = Arc::into_inner(stats).unwrap().into_inner().unwrap();
         backpropagate(attacker_nn, &stats);
     }

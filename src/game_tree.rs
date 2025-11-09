@@ -2,8 +2,8 @@ use std::collections::HashSet;
 use std::fmt::{Debug, Formatter};
 
 use crate::game::board::Board;
-use crate::game::{Play, PreviousBoards, Status};
-use crate::game::space::{EXIT_SQUARES, Role, Square, SquareIter};
+use crate::game::space::{AttackerIter, DefenderIter, EXIT_SQUARES, Role, Square};
+use crate::game::{NormalizedBoards, Play, PositionsTracker, Status};
 
 /// Determine if a position is "quiet" or not.
 /// Currently, we define threats as the ability
@@ -32,10 +32,10 @@ pub trait SelectionPolicy {
     ) -> std::cmp::Ordering;
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct GameTreeNode {
     pub status: Status,
-    pub previous_boards: PreviousBoards,
+    pub previous_boards: PositionsTracker,
     pub turn: Role,
     pub current_board: Board,
 }
@@ -45,7 +45,7 @@ impl Debug for GameTreeNode {
         f.debug_struct("Game")
             .field("status", &self.status)
             .field("turn", &self.turn)
-            .field("previous_boards", &self.previous_boards.0.len())
+            .field("previous_boards", &self.previous_boards.len())
             .field("current_board", &self.current_board.to_string())
             .finish()
     }
@@ -58,12 +58,15 @@ impl PartialEq for GameTreeNode {
             && self.current_board == other.current_board
     }
 }
-impl Eq for GameTreeNode{}
+impl Eq for GameTreeNode {}
 
 impl GameTreeNode {
-    pub fn new() -> Self {
+    pub fn new(positions_tracker: PositionsTracker) -> Self {
         Self {
-            ..Default::default()
+            status: Default::default(),
+            previous_boards: positions_tracker,
+            turn: Default::default(),
+            current_board: Default::default(),
         }
     }
 
@@ -71,34 +74,34 @@ impl GameTreeNode {
         &self,
         from: Square,
         to: Square,
-        normalized_games: &mut PreviousBoards,
-    ) -> Option<Self>
-    {
+        normalized_games: &mut NormalizedBoards,
+    ) -> Option<Self> {
         let play = Play {
             role: self.turn,
             from,
             to,
         };
-        let mut game = self.clone();
-        if let Ok((_, status)) =
-            game.current_board
-                .play(&play, &game.status, &mut game.previous_boards)
+        if let Ok((board, _, status)) =
+            self.current_board
+                .play_internal(&play, &self.status, &self.previous_boards)
         {
-            let mut normalized = game.clone().current_board;
-            normalized.normalize();
-            game.status = status;
-            game.turn = game.turn.opposite();
-            if normalized_games.0.insert(normalized) {
+            if normalized_games.insert(&board) {
+                let mut game = self.clone();
+                game.previous_boards.insert(&board);
+                game.current_board = board;
+                game.status = status;
+                game.turn = game.turn.opposite();
                 return Some(game);
             };
         }
         None
     }
+
     /// Get a vector of child games from this game by checking all
     /// legal moves. We discard children that are symmetrically
     /// equivalent to others.
     pub fn get_children(&self) -> Vec<GameTreeNode> {
-        let mut normalized = PreviousBoards::default();
+        let mut normalized = NormalizedBoards::default();
         let mut children = vec![];
         for from in Square::iter() {
             for to in Square::iter() {
@@ -113,11 +116,20 @@ impl GameTreeNode {
     /// Get an iterator over the child games from this game by checking all
     /// legal moves. We discard children that are symmetrically
     /// equivalent to others.
+    ///
+    /// Depending on the turn to play, we iterator over the square in
+    /// different orders. For attackers, we try to stay within outer
+    /// three rows and for defenders, we look at moves from the inner
+    /// 5 x 5 square to the outer three rows.
     pub fn children(self) -> ChildIterator {
+        let from = match self.turn {
+            Role::Attacker => ChildIteratorType::Attacker(Default::default()),
+            Role::Defender => ChildIteratorType::Defender(Default::default()),
+        };
         ChildIterator {
             node: self,
-            from: Square::iter(),
-            to: Square::iter(),
+            from,
+            to: ChildIteratorType::Attacker(Default::default()),
             normalized: Default::default(),
         }
     }
@@ -125,7 +137,10 @@ impl GameTreeNode {
         !matches!(self.status, Status::Ongoing)
     }
 
-    pub fn select_child<S: SelectionPolicy<TreeNode = GameTreeNode>>(&self, policy: &S) -> GameTreeNode {
+    pub fn select_child<S: SelectionPolicy<TreeNode = GameTreeNode>>(
+        &self,
+        policy: &S,
+    ) -> GameTreeNode {
         let legal_actions = match self.threats() {
             Threats::Quiet => self.get_children(),
             Threats::Plays(threats) => threats,
@@ -136,10 +151,7 @@ impl GameTreeNode {
 
         legal_actions
             .into_iter()
-            .max_by(|child1, child2| {
-                policy
-                    .compare_children(self, child1, child2)
-            })
+            .max_by(|child1, child2| policy.compare_children(self, child1, child2))
             .unwrap()
     }
 
@@ -200,35 +212,58 @@ impl GameTreeNode {
     }
 }
 
+/// These iterate over the squares in a different order
+/// depensing on the situation
+pub enum ChildIteratorType {
+    Attacker(AttackerIter),
+    Defender(DefenderIter),
+}
+
+impl ChildIteratorType {
+    fn reset(&mut self) {
+        *self = match self {
+            ChildIteratorType::Attacker(_) => ChildIteratorType::Attacker(Default::default()),
+            ChildIteratorType::Defender(_) => ChildIteratorType::Defender(Default::default()),
+        }
+    }
+}
+
+impl Iterator for ChildIteratorType {
+    type Item = Square;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            ChildIteratorType::Attacker(iter) => iter.next(),
+            ChildIteratorType::Defender(iter) => iter.next(),
+        }
+    }
+}
+
 /// A iterator over child nodes of a node in the game tree.
 /// Only returns normalized boards in an attempt to reduce
 /// the branching factor.
 pub struct ChildIterator {
     pub node: GameTreeNode,
-    pub from: SquareIter,
-    pub to: SquareIter,
-    pub normalized: PreviousBoards,
+    pub from: ChildIteratorType,
+    pub to: ChildIteratorType,
+    pub normalized: NormalizedBoards,
 }
 
 impl Iterator for ChildIterator {
     type Item = GameTreeNode;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some(from) = self.from.next() {
-            while let Some(to) = self.to.next() {
-                if let Some(node) = self.node
-                    .play(from, to, &mut self.normalized)
-                {
+        for from in self.from.by_ref() {
+            for to in self.to.by_ref() {
+                if let Some(node) = self.node.play(from, to, &mut self.normalized) {
                     return Some(node);
                 }
             }
-            self.to = Square::iter();
+            self.to.reset();
         }
         None
     }
 }
-
-
 
 /// An abbreviated view of a game state. Used when game history is
 /// not needed to minimize space usage.
@@ -244,7 +279,7 @@ impl From<&GameTreeNode> for GameSummary {
     fn from(node: &GameTreeNode) -> Self {
         Self {
             status: node.status,
-            moves: node.previous_boards.0.len(),
+            moves: node.previous_boards.len(),
             turn: node.turn,
             current_board: node.current_board.clone(),
         }

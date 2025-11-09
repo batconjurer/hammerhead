@@ -1,14 +1,14 @@
+use serde::ser::SerializeTuple;
+use serde::{Deserialize, Serialize, Serializer};
+use std::cmp::Ordering;
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
-use serde_with::serde_as;
-
 use crate::game::space::{
-    BOARD_LETTERS, EXIT_SQUARES, RESTRICTED_SQUARES, Role, Space, Square, THRONE,
+    BOARD_LETTERS, EXIT_SQUARES, RESTRICTED_SQUARES, Role, Space, Square, SquareSet, THRONE,
 };
 use crate::game::symmetries::{D8, D8Generator};
-use crate::game::{Play, PreviousBoards, Status};
+use crate::game::{Play, PlayError, PositionsTracker, Status};
 
 pub const STARTING_POSITION: [&str; 11] = [
     "...OOOOO...",
@@ -24,13 +24,38 @@ pub const STARTING_POSITION: [&str; 11] = [
     "...OOOOO...",
 ];
 
-#[serde_as]
-#[derive(Clone, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Eq, Hash, PartialEq, Deserialize)]
 pub struct Board {
-    #[serde_as(as = "[_; 121]")]
+    #[serde(deserialize_with = "deserialize_space_array")]
     pub spaces: [Space; 11 * 11],
 }
 
+impl Serialize for Board {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut tup = serializer.serialize_tuple(121)?;
+        for sp in &self.spaces {
+            tup.serialize_element(sp)?;
+        }
+        tup.end()
+    }
+}
+
+fn deserialize_space_array<'de, D>(deserializer: D) -> Result<[Space; 121], D::Error>
+where
+    D: serde::de::Deserializer<'de>,
+{
+    let spaces = Vec::<Space>::deserialize(deserializer)?;
+    if spaces.len() != 121 {
+        Err(serde::de::Error::custom(
+            "Unexpected number of spaces, should be 121",
+        ))
+    } else {
+        Ok(spaces.try_into().unwrap())
+    }
+}
 impl Default for Board {
     fn default() -> Self {
         STARTING_POSITION.try_into().unwrap()
@@ -142,7 +167,9 @@ impl Board {
     }
 
     pub fn empty() -> Self {
-        Self { spaces: [Space::Empty; 11 * 11]}
+        Self {
+            spaces: [Space::Empty; 11 * 11],
+        }
     }
 
     /// Rotate and / or flip the board so that the king is as close to the origin
@@ -194,16 +221,53 @@ impl Board {
         syms
     }
 
+    pub fn as_bitboard(&self) -> [u8; 30] {
+        let mut bitboard = [0u8; 30];
+        for (ix, sp) in self.spaces.iter().enumerate() {
+            // there is no need to encode the throne. If the king is
+            // not present elsewhere in the bitboard, we know he is on
+            // the throne
+            let index = match ix.cmp(&60) {
+                Ordering::Greater => ix - 1,
+                Ordering::Less => ix,
+                Ordering::Equal => continue,
+            };
+
+            //a 2 bit value for each of the four types of spaces
+            let value = match sp {
+                Space::Occupied(Role::Attacker) => 1u8,
+                Space::Occupied(Role::Defender) => 2u8,
+                Space::King => 3u8,
+                Space::Empty => continue,
+            };
+            let slot = (2 * index) / 8;
+            // this is the same as (2 * ix) (mod 8)
+            let pos = (2 * index) & 7;
+            bitboard[slot] += value << (6 - pos);
+        }
+        bitboard
+    }
+
     /// Find which non-King pieces are captured when player `side` moves
     /// to square `dest`.
     #[allow(clippy::collapsible_if)]
     fn captures(&self, dest: &Square, side: &Role) -> Vec<Square> {
         let mut captures = vec![];
+        // the throne can only be used in captures if not occupied by the king
+        let throne_capture = match self.find_the_king() {
+            None => unreachable!(),
+            Some(square) => square != THRONE,
+        };
+        // the conditions necessary for a capture
+        let is_capture = |sq: &Square| {
+            sq.is_exit() || self.get(sq).is_ally(side) || (*sq == THRONE && throne_capture)
+        };
+
         if let Some(up_1) = dest.up() {
             let space = self.get(&up_1);
             if space != Space::King && space != Space::Empty && !space.is_ally(side) {
                 if let Some(up_2) = up_1.up() {
-                    if up_2.is_restricted() || self.get(&up_2).is_ally(side) {
+                    if is_capture(&up_2) {
                         captures.push(up_1);
                     }
                 }
@@ -214,7 +278,7 @@ impl Board {
             let space = self.get(&left_1);
             if space != Space::King && space != Space::Empty && !space.is_ally(side) {
                 if let Some(left_2) = left_1.left() {
-                    if left_2.is_restricted() || self.get(&left_2).is_ally(side) {
+                    if is_capture(&left_2) {
                         captures.push(left_1);
                     }
                 }
@@ -225,7 +289,7 @@ impl Board {
             let space = self.get(&down_1);
             if space != Space::King && space != Space::Empty && !space.is_ally(side) {
                 if let Some(down_2) = down_1.down() {
-                    if down_2.is_restricted() || self.get(&down_2).is_ally(side) {
+                    if is_capture(&down_2) {
                         captures.push(down_1);
                     }
                 }
@@ -236,7 +300,7 @@ impl Board {
             let space = self.get(&right_1);
             if space != Space::King && space != Space::Empty && !space.is_ally(side) {
                 if let Some(right_2) = right_1.right() {
-                    if right_2.is_restricted() || self.get(&right_2).is_ally(side) {
+                    if is_capture(&right_2) {
                         captures.push(right_1);
                     }
                 }
@@ -437,7 +501,8 @@ impl Board {
             }
             // Do a breadth-first search from the corner
             let mut queue = VecDeque::from([corner]);
-            let mut visited = HashSet::from([corner]);
+            let mut visited = SquareSet::default();
+            visited.add(corner);
             while let Some(sq) = queue.pop_front() {
                 for neighbor in [sq.up(), sq.down(), sq.left(), sq.right()]
                     .into_iter()
@@ -450,14 +515,14 @@ impl Board {
                         Space::Occupied(Role::Attacker) => {
                             if sq == corner && !visited.contains(&neighbor) {
                                 queue.push_back(neighbor);
-                                visited.insert(neighbor);
+                                visited.add(neighbor);
                             }
                         }
                         // traverse through this space
                         Space::Empty => {
                             if !visited.contains(&neighbor) {
                                 queue.push_back(neighbor);
-                                visited.insert(neighbor);
+                                visited.add(neighbor);
                             }
                         }
                     }
@@ -472,6 +537,15 @@ impl Board {
         self.spaces[square.y * 11 + square.x]
     }
 
+    pub fn is_occupied(&self, square: &Square) -> bool {
+        let space = self.get(square);
+        match space {
+            Space::Empty => false,
+            Space::Occupied(_) => true,
+            Space::King => true,
+        }
+    }
+
     /// Play a move. Errors if the play is invalid or the game is already over.
     /// Stores the board in the history for checking repeated positions and enforcing
     /// the one hundred move limit.
@@ -479,10 +553,10 @@ impl Board {
         &mut self,
         play: &Play,
         status: &Status,
-        previous_boards: &mut PreviousBoards,
-    ) -> anyhow::Result<(Vec<Square>, Status)> {
+        previous_boards: &mut PositionsTracker,
+    ) -> Result<(Vec<Square>, Status), PlayError> {
         let (board, captures, status) = self.play_internal(play, status, previous_boards)?;
-        previous_boards.0.insert(board.clone());
+        previous_boards.insert(&board);
         *self = board;
 
         Ok((captures, status))
@@ -496,21 +570,16 @@ impl Board {
         &self,
         play: &Play,
         status: &Status,
-        previous_boards: &PreviousBoards,
-    ) -> anyhow::Result<(Board, Vec<Square>, Status)> {
+        previous_boards: &PositionsTracker,
+    ) -> Result<(Board, Vec<Square>, Status), PlayError> {
         if *status != Status::Ongoing {
-            return Err(anyhow::Error::msg(
-                "play: the game has to be ongoing to play",
-            ));
+            return Err(PlayError::GameFinished);
         }
         play.valid()?;
 
         let space_from = self.get(&play.from);
         if !space_from.is_ally(&play.role) {
-            return Err(anyhow::Error::msg(format!(
-                "play: you must select of piece of type {}",
-                play.role,
-            )));
+            return Err(PlayError::WrongTurn);
         }
 
         let x_diff = play.from.x as i32 - play.to.x as i32;
@@ -526,9 +595,7 @@ impl Board {
 
                 let space = self.get(&sq);
                 if space != Space::Empty {
-                    return Err(anyhow::Error::msg(
-                        "play: pieces may not move through other pieces",
-                    ));
+                    return Err(PlayError::MoveThroughPiece);
                 }
             }
         } else {
@@ -540,17 +607,13 @@ impl Board {
                 };
                 let space = self.get(&sq);
                 if space != Space::Empty {
-                    return Err(anyhow::Error::msg(
-                        "play: pieces may not move through other pieces",
-                    ));
+                    return Err(PlayError::MoveThroughPiece);
                 }
             }
         }
 
         if space_from != Space::King && RESTRICTED_SQUARES.contains(&play.to) {
-            return Err(anyhow::Error::msg(
-                "play: only the king may move to a restricted square",
-            ));
+            return Err(PlayError::RestrictedSquare);
         }
 
         let mut board = self.clone();
@@ -572,10 +635,10 @@ impl Board {
             return Ok((board, captures, Status::AttackersWin));
         }
 
-        if previous_boards.0.contains(&board) && play.role == Role::Defender {
-            return Err(anyhow::Error::msg(
-                "play: a defender can't repeat a board position",
-            ));
+        if let PositionsTracker::Previous(prev) = previous_boards {
+            if prev.0.contains(&board) && play.role == Role::Defender {
+                return Err(PlayError::RepeatedPosition);
+            }
         }
 
         if board.flood_fill_attackers_win() {
@@ -586,7 +649,7 @@ impl Board {
             return Ok((board, captures, play.role.victory()));
         }
 
-        if previous_boards.0.len() >= 100 {
+        if previous_boards.len() >= 100 {
             return Ok((board, captures, Status::Draw));
         }
 
@@ -596,11 +659,26 @@ impl Board {
     pub fn set(&mut self, square: &Square, space: Space) {
         self.spaces[square.y * 11 + square.x] = space;
     }
+
+    pub fn attackers(&self) -> u8 {
+        self.spaces
+            .iter()
+            .filter(|sp| matches!(sp, Space::Occupied(Role::Attacker)))
+            .count() as u8
+    }
+
+    pub fn defenders(&self) -> u8 {
+        self.spaces
+            .iter()
+            .filter(|sp| matches!(sp, Space::Occupied(Role::Defender) | Space::King))
+            .count() as u8
+    }
 }
 
 #[cfg(test)]
 mod test_board {
     use super::*;
+    use crate::game::PreviousBoards;
 
     /// Test we can detect if a side still has a legal move
     #[test]
@@ -651,7 +729,7 @@ mod test_board {
             "...........",
             "...........",
             "...........",
-            "...........",
+            ".....K.....",
             "...........",
             "...........",
             "...........",
@@ -950,6 +1028,7 @@ mod test_board {
     #[test]
     fn test_move_opponents_piece() {
         let board = Board::default();
+        let previous_boards = PositionsTracker::Previous(Default::default());
         let err = board
             .play_internal(
                 &Play {
@@ -958,11 +1037,14 @@ mod test_board {
                     to: Square { x: 3, y: 9 },
                 },
                 &Status::Ongoing,
-                &Default::default(),
+                &previous_boards,
             )
             .unwrap_err()
             .to_string();
-        assert_eq!(err, "play: you must select of piece of type defender");
+        assert_eq!(
+            err,
+            "Attempted to move a piece belonging to the opposite player"
+        );
 
         let err = board
             .play_internal(
@@ -972,17 +1054,21 @@ mod test_board {
                     to: Square { x: 5, y: 4 },
                 },
                 &Status::Ongoing,
-                &Default::default(),
+                &previous_boards,
             )
             .unwrap_err()
             .to_string();
-        assert_eq!(err, "play: you must select of piece of type attacker");
+        assert_eq!(
+            err,
+            "Attempted to move a piece belonging to the opposite player"
+        );
     }
 
     /// Test that moving pieces through other pieces is forbidden
     #[test]
     fn test_moving_through_other_pieces() {
         let board = Board::default();
+        let previous_boards = PositionsTracker::Previous(Default::default());
         let err = board
             .play_internal(
                 &Play {
@@ -991,11 +1077,11 @@ mod test_board {
                     to: Square { x: 2, y: 5 },
                 },
                 &Status::Ongoing,
-                &Default::default(),
+                &previous_boards,
             )
             .unwrap_err()
             .to_string();
-        assert_eq!(err, "play: pieces may not move through other pieces");
+        assert_eq!(err, "Attempted to move a piece through another piece");
         let err = board
             .play_internal(
                 &Play {
@@ -1004,11 +1090,11 @@ mod test_board {
                     to: Square { x: 8, y: 5 },
                 },
                 &Status::Ongoing,
-                &Default::default(),
+                &previous_boards,
             )
             .unwrap_err()
             .to_string();
-        assert_eq!(err, "play: pieces may not move through other pieces");
+        assert_eq!(err, "Attempted to move a piece through another piece");
         let err = board
             .play_internal(
                 &Play {
@@ -1017,11 +1103,11 @@ mod test_board {
                     to: Square { x: 5, y: 8 },
                 },
                 &Status::Ongoing,
-                &Default::default(),
+                &previous_boards,
             )
             .unwrap_err()
             .to_string();
-        assert_eq!(err, "play: pieces may not move through other pieces");
+        assert_eq!(err, "Attempted to move a piece through another piece");
         let err = board
             .play_internal(
                 &Play {
@@ -1030,11 +1116,11 @@ mod test_board {
                     to: Square { x: 5, y: 2 },
                 },
                 &Status::Ongoing,
-                &Default::default(),
+                &previous_boards,
             )
             .unwrap_err()
             .to_string();
-        assert_eq!(err, "play: pieces may not move through other pieces");
+        assert_eq!(err, "Attempted to move a piece through another piece");
     }
 
     /// Test moving to / through restricted squares
@@ -1055,6 +1141,7 @@ mod test_board {
         ];
 
         let board = Board::try_from(board).expect("Test failed");
+        let previous_boards = PositionsTracker::Previous(Default::default());
         // passing through throne is allowed
         assert!(
             board
@@ -1065,7 +1152,7 @@ mod test_board {
                         to: Square { x: 5, y: 9 },
                     },
                     &Status::Ongoing,
-                    &Default::default(),
+                    &previous_boards,
                 )
                 .is_ok()
         );
@@ -1078,7 +1165,7 @@ mod test_board {
                         to: Square { x: 5, y: 1 },
                     },
                     &Status::Ongoing,
-                    &Default::default(),
+                    &previous_boards,
                 )
                 .is_ok()
         );
@@ -1091,11 +1178,11 @@ mod test_board {
                     to: Square { x: 5, y: 5 },
                 },
                 &Status::Ongoing,
-                &Default::default(),
+                &previous_boards,
             )
             .unwrap_err()
             .to_string();
-        assert_eq!(err, "play: only the king may move to a restricted square");
+        assert_eq!(err, "Only the king may move to a restricted square");
         let err = board
             .play_internal(
                 &Play {
@@ -1104,11 +1191,11 @@ mod test_board {
                     to: Square { x: 5, y: 5 },
                 },
                 &Status::Ongoing,
-                &Default::default(),
+                &previous_boards,
             )
             .unwrap_err()
             .to_string();
-        assert_eq!(err, "play: only the king may move to a restricted square");
+        assert_eq!(err, "Only the king may move to a restricted square");
         // only king can move to corner
         let err = board
             .play_internal(
@@ -1118,11 +1205,11 @@ mod test_board {
                     to: Square { x: 10, y: 0 },
                 },
                 &Status::Ongoing,
-                &Default::default(),
+                &previous_boards,
             )
             .unwrap_err()
             .to_string();
-        assert_eq!(err, "play: only the king may move to a restricted square");
+        assert_eq!(err, "Only the king may move to a restricted square");
         let err = board
             .play_internal(
                 &Play {
@@ -1131,11 +1218,11 @@ mod test_board {
                     to: Square { x: 10, y: 10 },
                 },
                 &Status::Ongoing,
-                &Default::default(),
+                &previous_boards,
             )
             .unwrap_err()
             .to_string();
-        assert_eq!(err, "play: only the king may move to a restricted square");
+        assert_eq!(err, "Only the king may move to a restricted square");
         // king can move to restricted squares
         assert!(
             board
@@ -1146,7 +1233,7 @@ mod test_board {
                         to: Square { x: 5, y: 5 },
                     },
                     &Status::Ongoing,
-                    &Default::default(),
+                    &previous_boards,
                 )
                 .is_ok()
         );
@@ -1159,7 +1246,7 @@ mod test_board {
                         to: Square { x: 0, y: 10 },
                     },
                     &Status::Ongoing,
-                    &Default::default(),
+                    &previous_boards,
                 )
                 .is_ok()
         );
@@ -1182,10 +1269,10 @@ mod test_board {
             "...OOOOO...",
         ];
         let board = Board::try_from(board).expect("Test failed");
-        let mut previous_boards = PreviousBoards::default();
-        previous_boards.0.insert(Board::default());
+        let mut previous_boards = PositionsTracker::Previous(PreviousBoards::default());
+        previous_boards.insert(&Board::default());
         // cannot repeat if defender
-        let (_, _, status) = board
+        let err = board
             .play_internal(
                 &Play {
                     role: Role::Defender,
@@ -1195,8 +1282,9 @@ mod test_board {
                 &Status::Ongoing,
                 &previous_boards,
             )
-            .expect("Test failed");
-        assert_eq!(status, Status::AttackersWin);
+            .expect_err("Test failed")
+            .to_string();
+        assert_eq!(err, "A defender can't repeat a board position");
         // can repeat if attacker
         let board = [
             "...OOOOO...",
@@ -1244,6 +1332,7 @@ mod test_board {
             "...OOOOO...",
         ];
         let board = Board::try_from(board).expect("Test failed");
+        let previous_boards = PositionsTracker::Previous(Default::default());
         let (_, _, status) = board
             .play_internal(
                 &Play {
@@ -1252,7 +1341,7 @@ mod test_board {
                     to: Square { x: 10, y: 10 },
                 },
                 &Status::Ongoing,
-                &Default::default(),
+                &previous_boards,
             )
             .expect("Test failed");
         assert_eq!(status, Status::DefendersWin);
@@ -1274,7 +1363,7 @@ mod test_board {
             "...OOOOO...",
         ];
         let mut board = Board::try_from(board).expect("Test failed");
-        let mut previous_boards = Default::default();
+        let mut previous_boards = PositionsTracker::Previous(Default::default());
         board
             .play(
                 &Play {
@@ -1319,7 +1408,8 @@ mod test_board {
             ".X.........",
             ".X.........",
             "...........",
-        ]).expect("Test failed");
+        ])
+        .expect("Test failed");
         let expected = board.clone();
         board.normalize();
         assert_eq!(board, expected);
@@ -1336,7 +1426,8 @@ mod test_board {
             ".X.........",
             ".X.........",
             "K..........",
-        ]).expect("Test failed");
+        ])
+        .expect("Test failed");
         board.normalize();
         let expected = Board::try_from([
             "K..........",
@@ -1350,7 +1441,8 @@ mod test_board {
             ".X.........",
             "...........",
             "...........",
-        ]).expect("Test failed");
+        ])
+        .expect("Test failed");
         assert_eq!(board, expected);
 
         let mut board = Board::try_from([
@@ -1365,7 +1457,8 @@ mod test_board {
             ".X.........",
             ".X........K",
             "...........",
-        ]).expect("Test failed");
+        ])
+        .expect("Test failed");
         board.normalize();
         let expected = Board::try_from([
             ".K.........",
@@ -1379,7 +1472,8 @@ mod test_board {
             "...........",
             ".XXX.XXXX..",
             "...........",
-        ]).expect("Test failed");
+        ])
+        .expect("Test failed");
         assert_eq!(board, expected);
     }
 
@@ -1400,7 +1494,8 @@ mod test_board {
             "...........",
             "...........",
             "...........",
-        ]).expect("Test failed");
+        ])
+        .expect("Test failed");
         let expected = HashSet::from([
             Board::try_from([
                 ".K.........",
@@ -1414,7 +1509,8 @@ mod test_board {
                 "...........",
                 "...........",
                 "...........",
-            ]).expect("Test failed"),
+            ])
+            .expect("Test failed"),
             Board::try_from([
                 "...........",
                 "K..........",
@@ -1427,7 +1523,8 @@ mod test_board {
                 "...........",
                 "...........",
                 "...........",
-            ]).expect("Test failed"),
+            ])
+            .expect("Test failed"),
             Board::try_from([
                 ".........K.",
                 "...........",
@@ -1440,7 +1537,8 @@ mod test_board {
                 "...........",
                 "...........",
                 "...........",
-            ]).expect("Test failed"),
+            ])
+            .expect("Test failed"),
             Board::try_from([
                 "...........",
                 "..........K",
@@ -1453,7 +1551,8 @@ mod test_board {
                 "...........",
                 "...........",
                 "...........",
-            ]).expect("Test failed"),
+            ])
+            .expect("Test failed"),
             Board::try_from([
                 "...........",
                 "...........",
@@ -1466,7 +1565,8 @@ mod test_board {
                 "...........",
                 "K..........",
                 "...........",
-            ]).expect("Test failed"),
+            ])
+            .expect("Test failed"),
             Board::try_from([
                 "...........",
                 "...........",
@@ -1479,7 +1579,8 @@ mod test_board {
                 "...........",
                 "...........",
                 ".K.........",
-            ]).expect("Test failed"),
+            ])
+            .expect("Test failed"),
             Board::try_from([
                 "...........",
                 "...........",
@@ -1492,7 +1593,8 @@ mod test_board {
                 "...........",
                 "..........K",
                 "...........",
-            ]).expect("Test failed"),
+            ])
+            .expect("Test failed"),
             Board::try_from([
                 "...........",
                 "...........",
@@ -1505,8 +1607,44 @@ mod test_board {
                 "...........",
                 "...........",
                 ".........K.",
-            ]).expect("Test failed"),
+            ])
+            .expect("Test failed"),
         ]);
         assert_eq!(expected, board.symmetries());
+    }
+
+    /// Test the bitboard representation of `Board`
+    #[test]
+    fn test_bitboard() {
+        let board = Board::default();
+        let bitboard = board.as_bitboard();
+
+        let expected = [
+            1u8, 85, 0, 0, 64, 0, 0, 0, 16, 8, 1, 64, 168, 5, 74, 161, 80, 42, 1, 64, 32, 4, 0, 0,
+            0, 1, 0, 0, 85, 64,
+        ];
+        assert_eq!(bitboard, expected);
+
+        let board_after = [
+            "...OOOOO...",
+            ".....O.....",
+            "...........",
+            "O....X....O",
+            "O...XXX...O",
+            "OO.XX.XX.OO",
+            "O...XXX...O",
+            "O....X....O",
+            "...........",
+            ".....O.....",
+            "...OOOOO..K",
+        ];
+        let board = Board::try_from(board_after).expect("Test failed");
+        let bitboard = board.as_bitboard();
+
+        let expected = [
+            1u8, 85, 0, 0, 64, 0, 0, 0, 16, 8, 1, 64, 168, 5, 74, 161, 80, 42, 1, 64, 32, 4, 0, 0,
+            0, 1, 0, 0, 85, 67,
+        ];
+        assert_eq!(bitboard, expected);
     }
 }

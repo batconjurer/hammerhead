@@ -1,6 +1,9 @@
 //! Hnefatafl is symmetric with respect to the symmetries of the square,
 //! the groupd D8. This contains utilities to exploit that symmetry.
 
+use rustc_hash::{FxHashMap, FxHashSet};
+use serde::{Deserialize, Serialize};
+
 use crate::game::board::Board;
 use crate::game::space::{Space, Square};
 
@@ -103,3 +106,114 @@ pub const D8: [D8Element; 8] = [
     // R^3
     D8Element([Some(D8Generator::F), Some(D8Generator::FR), None, None]),
 ];
+
+/// For each symmetry of a board, compute a byte
+/// vector. Return a hash of the sum of these vectors.
+/// This provides a hash that is invariant under board symmetries
+fn symmetric_hash(board: &Board) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut bytes = [[0u8; 30]; 8];
+    for (ix, d8) in D8.iter().enumerate() {
+        let mut b = board.clone();
+        d8.apply(&mut b);
+        bytes[ix] = b.as_bitboard();
+    }
+    bytes.sort_unstable();
+    let mut hasher = Sha256::default();
+    for b in bytes {
+        hasher.update(b);
+    }
+    hasher.finalize().into()
+}
+
+/// A hash map for storing data about boards that are not affected
+/// by the natural symmetries of the board.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NormalizedBoardMap<V>(FxHashMap<[u8; 32], V>);
+
+impl<V> NormalizedBoardMap<V> {
+    #[allow(dead_code)]
+    pub fn insert(&mut self, board: &Board, value: V) -> Option<V> {
+        self.0.insert(symmetric_hash(board), value)
+    }
+
+    #[allow(dead_code)]
+    pub fn contains_key(&self, board: &Board) -> bool {
+        self.0.contains_key(&symmetric_hash(board))
+    }
+
+    #[allow(dead_code)]
+    pub fn remove(&mut self, board: &Board) -> Option<V> {
+        self.0.remove(&symmetric_hash(board))
+    }
+
+    #[allow(dead_code)]
+    pub fn get(&self, board: &Board) -> Option<&V> {
+        self.0.get(&symmetric_hash(board))
+    }
+
+    #[allow(dead_code)]
+    pub fn get_mut(&mut self, board: &Board) -> Option<&mut V> {
+        self.0.get_mut(&symmetric_hash(board))
+    }
+}
+
+/// A hash set version of [`NormalizedBoardMap`]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NormalizedBoards(FxHashSet<[u8; 32]>);
+
+impl NormalizedBoards {
+    pub fn insert(&mut self, board: &Board) -> bool {
+        self.0.insert(symmetric_hash(board))
+    }
+
+    pub fn contains(&self, board: &Board) -> bool {
+        self.0.contains(&symmetric_hash(board))
+    }
+
+    pub fn remove(&mut self, board: &Board) -> bool {
+        self.0.remove(&symmetric_hash(board))
+    }
+}
+
+#[cfg(test)]
+mod test_symmetries {
+    use super::*;
+    use crate::game::{Play, PositionsTracker, Status};
+    use crate::game::space::Role;
+
+    #[test]
+    fn test_symmetric_hash() {
+        let board = Board::try_from([
+            "...OOOOO...",
+            "...X....O..",
+            ".........O.",
+            "...O.X....O",
+            "O....XX...O",
+            "...O..XX..O",
+            "O.O.....O.O",
+            "OX.O.......",
+            "..........K",
+            ".....O.....",
+            "....OO.O...",
+        ])
+        .expect("Test failed");
+
+        let previous_boards = PositionsTracker::Counter(0);
+        let mut normalized_boards = NormalizedBoards::default();
+        for from in Square::iter() {
+            for to in Square::iter() {
+                let play = Play {
+                    role: Role::Attacker,
+                    from,
+                    to,
+                };
+                if let Ok((board, _, _)) =
+                    board.play_internal(&play, &Status::Ongoing, &previous_boards)
+                {
+                    assert!(normalized_boards.insert(&board))
+                }
+            }
+        }
+    }
+}
